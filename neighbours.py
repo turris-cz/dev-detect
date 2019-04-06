@@ -11,8 +11,12 @@ from pyroute2 import IPRoute
 IPV4 = 2
 IPV6 = 10
 
+# default watched interfaces
+watched_interfaces = ['br-lan']
+
 
 # use this old code for time being
+# TODO: use new notification system
 def new_device_notify(mac, iface):
     def new_device_notify_thread(mac, iface):
         time.sleep(5)
@@ -31,15 +35,27 @@ def main():
 
     # TODO: load already known devices from database
 
+    interfaces = {}
+
     with IPRoute() as ipr:
+        links = ipr.get_links()
+
+        for l in links:
+            ifname = l.get_attr('IFLA_IFNAME')
+
+            # TODO: check if interface is also up
+            if ifname in watched_interfaces:
+                interfaces[l['index']] = ifname
+
+        # subscribe to broadcast
         ipr.bind()
 
         while True:
             messages = ipr.get()
 
             for message in messages:
-                # we are interested only in new devices
-                if message['event'] == 'RTM_NEWNEIGH':
+                # we are interested only in new devices on selected interfaces
+                if message['ifindex'] in interfaces and message['event'] == 'RTM_NEWNEIGH':
                     mac = message.get_attr('NDA_LLADDR')
                     ip = message.get_attr('NDA_DST')
 
