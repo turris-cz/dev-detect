@@ -59,6 +59,10 @@ def main():
                     mac = message.get_attr('NDA_LLADDR')
                     ip = message.get_attr('NDA_DST')
 
+                    # sometimes IP or MAC address is missing in netlink message
+                    if not mac or not ip:
+                        continue
+
                     if mac not in known_devices:
                         known_devices[mac] = [ip]
                         # TODO: write throught into persistent database
@@ -72,7 +76,7 @@ def main():
 
                         print("New device detected MAC: {} | IP{} address: {}".format(mac, ipver, ip))
 
-                    if ip and ip not in known_devices[mac]:
+                    if ip not in known_devices[mac]:
                         known_devices[mac].append(ip)
 
 
