@@ -69,6 +69,7 @@ def detect_devices(ipr, interfaces, known_devices):
                         ipver = 'v4'
                     elif message['family'] == IPV6:
                         ipver = 'v6'
+                    new_device_notify(mac, interfaces[message['ifindex']])
 
                     print("New device detected MAC: {} | IP{} address: {}".format(mac, ipver, ip))
 
