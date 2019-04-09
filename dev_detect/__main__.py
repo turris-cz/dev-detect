@@ -6,6 +6,8 @@ import threading
 
 from pyroute2 import IPRoute
 
+logger = logging.getLogger(__name__)
+
 # netlink constants
 # for details see netlink kernel header files
 IPV4 = 2
@@ -45,6 +47,15 @@ def get_interfaces(ipr):
     return active_interfaces
 
 
+def ip_version(address_family):
+    if address_family == IPV4:
+        return '4'
+    elif address_family == IPV6:
+        return '6'
+
+    return None
+
+
 def detect_devices(ipr, interfaces, known_devices):
     while True:
         messages = ipr.get()
@@ -63,21 +74,17 @@ def detect_devices(ipr, interfaces, known_devices):
                     known_devices[mac] = [ip]
                     # TODO: write throught into persistent database
 
-                    new_device_notify(mac, 'lan')
-
-                    if message['family'] == IPV4:
-                        ipver = 'v4'
-                    elif message['family'] == IPV6:
-                        ipver = 'v6'
                     new_device_notify(mac, interfaces[message['ifindex']])
 
-                    print("New device detected MAC: {} | IP{} address: {}".format(mac, ipver, ip))
+                    logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
 
                 if ip not in known_devices[mac]:
                     known_devices[mac].append(ip)
 
 
 def main():
+    logging.basicConfig()
+
     known_devices = {}
     # TODO: load already known devices from database
 
