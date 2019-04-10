@@ -1,4 +1,7 @@
+import logging
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 
 class Storage:
@@ -17,6 +20,20 @@ class Storage:
 
     def _init_connection(self):
         self.conn = sqlite3.connect(self.db_path)
+        self._check_database()
+
+    def _check_database(self):
+        """Check if table exist in database and create one if it doesn't"""
+        cur = self.conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='known_devices'")
+        result = cur.fetchone()
+
+        if not result:
+            logger.warning('Table is missing. Recreating database schema.')
+            cur.execute('CREATE TABLE known_devices (mac text, ip text)')
+            self.conn.commit()
+
+        cur.close()
 
     def _store(self, mac, ip):
         cur = self.conn.cursor()
