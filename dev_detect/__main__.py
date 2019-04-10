@@ -4,6 +4,7 @@ import subprocess
 import time
 import threading
 
+from euci import EUci
 from pyroute2 import IPRoute
 
 from .storage import Storage
@@ -14,10 +15,6 @@ logger = logging.getLogger(__name__)
 # for details see netlink kernel header files
 IPV4 = 2
 IPV6 = 10
-
-# default watched interfaces
-# TODO: get list from uci?
-watched_interfaces = ['br-lan']
 
 
 # use this old code for time being
@@ -35,7 +32,7 @@ def new_device_notify(mac, iface):
     thread.start()
 
 
-def get_interfaces(ipr):
+def get_interfaces(ipr, watched_interfaces):
     active_interfaces = {}
     links = ipr.get_links()
 
@@ -86,16 +83,20 @@ def detect_devices(ipr, interfaces, known_devices, storage):
 
 def main():
     logging.basicConfig()
+    uci = EUci()
 
-    storage = Storage()
+    persistent = uci.get_boolean('dev-detect.storage.persistent')
+    storage = Storage(persistent)
 
     known_devices = {}
     known_devices.update(storage.get_known())
 
+    watched_interfaces = uci.get('dev-detect.watchlist.ifaces')
+
     with IPRoute() as ipr:
         ipr.bind()  # subscribe to netlink broadcast
 
-        interfaces = get_interfaces(ipr)
+        interfaces = get_interfaces(ipr, watched_interfaces)
         detect_devices(ipr, interfaces, known_devices, storage)
 
 

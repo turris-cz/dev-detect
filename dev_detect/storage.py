@@ -4,8 +4,11 @@ import sqlite3
 class Storage:
     """Database storage of known devices"""
 
-    def __init__(self, db_path='/tmp/dev-detect.db'):
-        self.db_path = db_path
+    def __init__(self, persistent):
+        if persistent:
+            self.db_path = '/srv/dev-detect.db'
+        else:
+            self.db_path = '/tmp/dev-detect.db'
 
         self._init_connection()
 
