@@ -60,8 +60,11 @@ def detect_devices(ipr, interfaces, known_devices, storage):
         messages = ipr.get()
 
         for message in messages:
+            if 'ifindex' not in message:  # missing interface
+                continue
+
             # we are interested only in new devices on selected interfaces
-            if message['ifindex'] in interfaces and message['event'] == 'RTM_NEWNEIGH':
+            if message['event'] == 'RTM_NEWNEIGH' and message['ifindex'] in interfaces:
                 mac = message.get_attr('NDA_LLADDR')
                 ip = message.get_attr('NDA_DST')
 
