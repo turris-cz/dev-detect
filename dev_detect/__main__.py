@@ -96,13 +96,23 @@ def detect_devices(ipr, interfaces, known_devices, storage):
                 process_netlink_message(message, interfaces, known_devices, storage)
 
 
-
-
-
+def setup_logging(loglevel=logging.INFO):
+    logging_format = "%(levelname)s: %(message)s"
+    logging.basicConfig(level=loglevel, format=logging_format)
+    logger.setLevel(loglevel)
 
 
 def main():
-    logging.basicConfig()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--debug', help="Show debug messages", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.debug:
+        setup_logging(logging.DEBUG)
+    else:
+        setup_logging()
+
     uci = EUci()
 
     persistent = uci.get_boolean('dev-detect.storage.persistent')
