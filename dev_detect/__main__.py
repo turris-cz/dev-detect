@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 IPV4 = 2
 IPV6 = 10
 
+REACHABLE = 2
+
 
 # use this old code for time being
 # TODO: use new notification system
@@ -55,33 +57,48 @@ def ip_version(address_family):
     return None
 
 
-def detect_devices(ipr, interfaces, known_devices, storage):
-    while True:
-        messages = ipr.get()
+def process_netlink_message(message, interfaces, known_devices, storage):
+    mac = message.get_attr('NDA_LLADDR')
+    ip = message.get_attr('NDA_DST')
 
-        for message in messages:
+    # sometimes IP or MAC address is missing in netlink message
+    if not mac or not ip:
+        return
+
+    if mac not in known_devices:
+        known_devices[mac] = [ip]
+        storage.write_known(mac, ip)
+
+        new_device_notify(mac, interfaces[message['ifindex']])
+
+        logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
+
+
+def get_neigbours_from_arp(ipr, interfaces, known_devices, storage):
+    """Explicit query ARP table for reachable devices on selected interfaces"""
+    for nic in interfaces:
+        devices = ipr.get_neighbours(ifindex=nic)
+
+        for dev in devices:
+            if dev['state'] == REACHABLE:
+                process_netlink_message(dev, interfaces, known_devices, storage)
+
+
+def detect_devices(ipr, interfaces, known_devices, storage):
+    """Detect new devices from netlink broadcast"""
+    while True:
+        for message in ipr.get():
             if 'ifindex' not in message:  # missing interface
                 continue
 
             # we are interested only in new devices on selected interfaces
             if message['event'] == 'RTM_NEWNEIGH' and message['ifindex'] in interfaces:
-                mac = message.get_attr('NDA_LLADDR')
-                ip = message.get_attr('NDA_DST')
+                process_netlink_message(message, interfaces, known_devices, storage)
 
-                # sometimes IP or MAC address is missing in netlink message
-                if not mac or not ip:
-                    continue
 
-                if mac not in known_devices:
-                    known_devices[mac] = [ip]
-                    storage.write_known(mac, ip)
 
-                    new_device_notify(mac, interfaces[message['ifindex']])
 
-                    logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
 
-                # if ip not in known_devices[mac]:
-                #     known_devices[mac].append(ip)
 
 
 def main():
@@ -89,17 +106,19 @@ def main():
     uci = EUci()
 
     persistent = uci.get_boolean('dev-detect.storage.persistent')
+    watched_interfaces = uci.get('dev-detect.watchlist.ifaces')
+
     storage = Storage(persistent)
 
     known_devices = {}
     known_devices.update(storage.get_known())
 
-    watched_interfaces = uci.get('dev-detect.watchlist.ifaces')
-
     with IPRoute() as ipr:
+        interfaces = get_interfaces(ipr, watched_interfaces)
+        get_neigbours_from_arp(ipr, interfaces, known_devices, storage)
+
         ipr.bind()  # subscribe to netlink broadcast
 
-        interfaces = get_interfaces(ipr, watched_interfaces)
         detect_devices(ipr, interfaces, known_devices, storage)
 
 
