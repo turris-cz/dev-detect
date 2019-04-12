@@ -34,6 +34,19 @@ def new_device_notify(mac, iface):
     thread.start()
 
 
+def vendor_lookup(mac):
+    """Look up vendor based on MAC address"""
+    mac = mac[:8].replace(':', '').upper()
+
+    with open('/usr/share/ouidb/oui.db', 'r') as db:
+        for line in db:
+            mac_prefix, vendor = line.split('|')
+            if mac_prefix == mac:
+                return vendor.rstrip()
+
+    return 'Unknown'
+
+
 def get_interfaces(ipr, watched_interfaces):
     active_interfaces = {}
     links = ipr.get_links()
@@ -66,8 +79,10 @@ def process_netlink_message(message, interfaces, known_devices, storage):
         return
 
     if mac not in known_devices:
-        known_devices[mac] = [ip]
-        storage.write_known(mac, ip)
+        vendor = vendor_lookup(mac)
+
+        known_devices[mac] = vendor
+        storage.write_known(mac, vendor)
 
         new_device_notify(mac, interfaces[message['ifindex']])
 

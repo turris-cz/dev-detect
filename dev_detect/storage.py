@@ -30,31 +30,30 @@ class Storage:
 
         if not result:
             logger.warning('Table is missing. Recreating database schema.')
-            cur.execute('CREATE TABLE known_devices (mac text, ip text)')
+            cur.execute('CREATE TABLE known_devices (mac text, vendor text)')
             self.conn.commit()
 
         cur.close()
 
     def _store(self, mac, ip):
         cur = self.conn.cursor()
-        cur.execute('INSERT INTO known_devices (mac, ip) VALUES (?, ?)', (mac, ip))
+        cur.execute('INSERT INTO known_devices (mac, vendor) VALUES (?, ?)', (mac, ip))
 
         self.conn.commit()
         cur.close()
 
     def get_known(self):
         cur = self.conn.cursor()
-        cur.execute('SELECT mac, ip from known_devices')
+        cur.execute('SELECT mac, vendor from known_devices')
         results = cur.fetchall()
 
-        self.conn.commit()
         cur.close()
 
         known_devices = {}
 
         for row in results:
-            mac, ip = row
-            known_devices[mac] = ip
+            mac, vendor = row
+            known_devices[mac] = vendor
 
         return known_devices
 
