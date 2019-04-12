@@ -3,18 +3,22 @@ from setuptools import setup
 setup(
     name='dev-detect',
     version='0.1',
-    url='https://gitlab.labs.nic.cz/turris/devdetect',
     author='CZ.NIC, z.s.p.o. (http://www.nic.cz/)',
     author_email='packaging@turris.cz',
-    description='A utility to detect new devices on local network',
-    zip_safe=True,
     packages=['dev_detect'],
+    url='https://gitlab.labs.nic.cz/turris/pakon-dev-detect',
+    license='COPYING',
+    description='Small utility to detect devices on local network',
+    long_description=open('README.md').read(),
+    long_description_content_type="text/markdown",
     install_requires=[
         'pyroute2',
+        'pyuci',
     ],
     entry_points={
         'console_scripts': [
             'dev-detect = dev_detect.__main__:main'
         ]
     },
+    zip_safe=True,
 )
