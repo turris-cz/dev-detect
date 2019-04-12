@@ -52,17 +52,17 @@ def vendor_lookup(mac):
 
 
 def get_interfaces(ipr, watched_interfaces):
-    active_interfaces = {}
+    """Try to find all watched interfaces among present ones"""
+    interfaces = {}
     links = ipr.get_links()
 
     for l in links:
         ifname = l.get_attr('IFLA_IFNAME')
 
-        # TODO: check if interface is also up
         if ifname in watched_interfaces:
-            active_interfaces[l['index']] = ifname
+            interfaces[l['index']] = ifname
 
-    return active_interfaces
+    return interfaces
 
 
 def ip_version(address_family):
