@@ -70,5 +70,6 @@ class Storage:
         return self.known_devices
 
     def write_new(self, mac):
-        self.known_devices.append(mac)
-        self._store(mac)
+        if mac not in self.known_devices:
+            self.known_devices.append(mac)
+            self._store(mac)
