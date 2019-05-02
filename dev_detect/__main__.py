@@ -74,7 +74,7 @@ def ip_version(address_family):
     return None
 
 
-def process_netlink_message(message, interfaces, known_devices, storage):
+def process_netlink_message(message, interfaces, storage):
     mac = message.get_attr('NDA_LLADDR')
     ip = message.get_attr('NDA_DST')
 
@@ -82,28 +82,25 @@ def process_netlink_message(message, interfaces, known_devices, storage):
     if not mac or not ip:
         return
 
-    if mac not in known_devices:
-        vendor = vendor_lookup(mac)
-
-        known_devices[mac] = vendor
-        storage.write_known(mac, vendor)
+    if mac not in storage.get_known():
+        storage.write_new(mac)
 
         new_device_notify(mac, interfaces[message['ifindex']])
 
         logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
 
 
-def get_neigbours_from_arp(ipr, interfaces, known_devices, storage):
+def get_neigbours_from_arp(ipr, interfaces, storage):
     """Explicit query ARP table for reachable devices on selected interfaces"""
     for nic in interfaces:
         devices = ipr.get_neighbours(ifindex=nic)
 
         for dev in devices:
             if dev['state'] == REACHABLE:
-                process_netlink_message(dev, interfaces, known_devices, storage)
+                process_netlink_message(dev, interfaces, storage)
 
 
-def detect_devices(ipr, interfaces, known_devices, storage):
+def detect_devices(ipr, interfaces, storage):
     """Detect new devices from netlink broadcast"""
     while True:
         for message in ipr.get():
@@ -112,7 +109,7 @@ def detect_devices(ipr, interfaces, known_devices, storage):
 
             # we are interested only in new devices on selected interfaces
             if message['event'] == 'RTM_NEWNEIGH' and message['ifindex'] in interfaces:
-                process_netlink_message(message, interfaces, known_devices, storage)
+                process_netlink_message(message, interfaces, storage)
 
 
 def setup_logging(loglevel=logging.INFO):
@@ -134,21 +131,18 @@ def main():
 
     uci = EUci()
 
-    persistent = uci.get_boolean('dev-detect.storage.persistent')
+    db_path = uci.get('dev-detect.storage.db_path')
     watched_interfaces = uci.get('dev-detect.watchlist.ifaces')
 
-    storage = Storage(persistent)
-
-    known_devices = {}
-    known_devices.update(storage.get_known())
+    storage = Storage(db_path)
 
     with IPRoute() as ipr:
         interfaces = get_interfaces(ipr, watched_interfaces)
-        get_neigbours_from_arp(ipr, interfaces, known_devices, storage)
+        get_neigbours_from_arp(ipr, interfaces, storage)
 
         ipr.bind()  # subscribe to netlink broadcast
 
-        detect_devices(ipr, interfaces, known_devices, storage)
+        detect_devices(ipr, interfaces, storage)
 
 
 if __name__ == "__main__":

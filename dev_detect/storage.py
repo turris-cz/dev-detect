@@ -1,33 +1,17 @@
 import logging
 import sqlite3
 
-from euci import EUci
-
 logger = logging.getLogger(__name__)
-
-# TODO: merge query execution into single function
 
 
 class Storage:
     """Database storage of known devices"""
 
-    def __init__(self, persistent=False):
-        self.uci = EUci()
-
-        persistent_db_path = self.uci.get('dev-detect.storage.persistent_db_path')
-        if not persistent_db_path:
-            persistent_db_path = '/srv/dev-detect.db'
-
-        volatile_db_path = self.uci.get('dev-detect.storage.volatile_db_path')
-        if not volatile_db_path:
-            volatile_db_path = '/tmp/dev-detect.db'
-
-        if persistent:
-            self.db_path = persistent_db_path
-        else:
-            self.db_path = volatile_db_path
+    def __init__(self, db_path):
+        self.db_path = db_path
 
         self._init_connection()
+        self._fetch_known()
 
     def __del__(self):
         self.conn.close()
@@ -46,18 +30,18 @@ class Storage:
 
             if not result:
                 logger.warning('Table is missing. Recreating database schema.')
-                cur.execute('CREATE TABLE known_devices (mac text, vendor text)')
+                cur.execute('CREATE TABLE known_devices (mac text)')
                 self.conn.commit()
         except sqlite3.OperationalError:
             logger.error('Something went wrong during query execution:', exc_info=True)
         finally:
             cur.close()
 
-    def _store(self, mac, ip):
+    def _store(self, mac):
         cur = self.conn.cursor()
 
         try:
-            cur.execute('INSERT INTO known_devices (mac, vendor) VALUES (?, ?)', (mac, ip))
+            cur.execute('INSERT INTO known_devices (mac) VALUES (?)', (mac, ))
 
             self.conn.commit()
         except sqlite3.OperationalError:
@@ -65,24 +49,26 @@ class Storage:
         finally:
             cur.close()
 
-    def get_known(self):
+    def _fetch_known(self):
         cur = self.conn.cursor()
 
         try:
-            cur.execute('SELECT mac, vendor from known_devices')
+            cur.execute('SELECT mac from known_devices')
             results = cur.fetchall()
         except sqlite3.OperationalError:
             logger.error('Something went wrong during query execution:', exc_info=True)
         finally:
             cur.close()
 
-        known_devices = {}
+        self.known_devices = []
 
         for row in results:
-            mac, vendor = row
-            known_devices[mac] = vendor
+            mac = row[0]
+            self.known_devices.append(mac)
 
-        return known_devices
+    def get_known(self):
+        return self.known_devices
 
-    def write_known(self, mac, ip):
-        self._store(mac, ip)
+    def write_new(self, mac):
+        self.known_devices.append(mac)
+        self._store(mac)
