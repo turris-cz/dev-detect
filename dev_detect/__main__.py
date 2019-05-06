@@ -34,23 +34,6 @@ def new_device_notify(mac, iface):
     thread.start()
 
 
-def vendor_lookup(mac):
-    """Look up vendor based on MAC address"""
-    mac = mac[:8].replace(':', '').upper()
-
-    try:
-        with open('/usr/share/ouidb/oui.db', 'r') as db:
-            for line in db:
-                mac_prefix, vendor = line.split('|')
-                if mac_prefix == mac:
-                    return vendor.rstrip()
-
-        return 'Unknown'
-    except FileNotFoundError:
-        logger.warning('MAC address vendor database file is missing')
-        return 'Unknown'
-
-
 def get_interfaces(ipr, watched_interfaces):
     """Try to find all watched interfaces among present ones"""
     interfaces = {}
