@@ -68,6 +68,8 @@ def process_netlink_message(message, interfaces, storage):
     if mac not in storage.get_known():
         storage.write_new(mac)
 
+        # interfaces are there just to conform to notify shell script interface
+        # TODO: use interface name elsewhere? omit it in notifications completely?
         new_device_notify(mac, interfaces[message['ifindex']])
 
         logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
