@@ -4,14 +4,12 @@ import sqlite3
 logger = logging.getLogger(__name__)
 
 
-class Storage:
+class DatabaseStorage:
     """Database storage of known devices"""
-
     def __init__(self, db_path):
         self.db_path = db_path
 
         self._init_connection()
-        self._fetch_known()
 
     def __del__(self):
         self.conn.close()
@@ -37,7 +35,7 @@ class Storage:
         finally:
             cur.close()
 
-    def _store(self, mac):
+    def store(self, mac):
         cur = self.conn.cursor()
 
         try:
@@ -49,7 +47,7 @@ class Storage:
         finally:
             cur.close()
 
-    def _fetch_known(self):
+    def fetch_known(self):
         cur = self.conn.cursor()
 
         try:
@@ -60,11 +58,22 @@ class Storage:
         finally:
             cur.close()
 
-        self.known_devices = []
+        res = []
 
         for row in results:
             mac = row[0]
-            self.known_devices.append(mac)
+            res.append(mac)
+
+        return res
+
+
+# TODO: more accurate class name?
+class Storage:
+    """High level interface for storage that acts as known devices cache"""
+    def __init__(self, db_path):
+        self.db_storage = DatabaseStorage(db_path)
+
+        self.known_devices = self.db_storage.fetch_known()
 
     def get_known(self):
         return self.known_devices
@@ -72,4 +81,4 @@ class Storage:
     def write_new(self, mac):
         if mac not in self.known_devices:
             self.known_devices.append(mac)
-            self._store(mac)
+            self.db_storage.store(mac)
