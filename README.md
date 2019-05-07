@@ -19,20 +19,11 @@ There is no foris settings tab yet, so any changes has to be done manually.
 
 This behavior is suitable for network where you can expect lots of different clients connecting through your router, e.g. public Wi-Fi AP.
 
-If you expect small number of devices that appears regularly (e.g. home network, small office), you can store known devices persistently. Just set option `persistent` to `1`
+If you expect small number of devices that appears regularly (e.g. home network, small office), you can store known devices permanently. Just change `db_path` to location on persistent storage (flash drive, external HDD).
 
 ```
 config storage 'storage'
-    option persistent 1
-```
-
-You can also set database locations via `persistent_db_path` and `volatile_db_path` option.
-
-
-```
-config storage 'storage`
-    option persistent_db_path '/path/to/persistent.db'
-    option volatile_db_path   '/path/to/volatile.db'
+    option db_path   '/path/to/persistent/storage/dev-detect.db'
 ```
 
 ### Watch list
