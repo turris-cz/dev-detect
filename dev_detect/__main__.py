@@ -116,8 +116,8 @@ def main():
 
     uci = EUci()
 
-    db_path = uci.get('dev-detect.storage.db_path')
-    watched_interfaces = uci.get('dev-detect.watchlist.ifaces')
+    db_path = uci.get_default('dev-detect.storage.db_path', default='/srv/dev-detect/dev-detect.db')
+    watched_interfaces = uci.get_default('dev-detect.watchlist.ifaces', default=('br-lan', 'br-guest_turris'))
 
     storage = Storage(db_path)
 
