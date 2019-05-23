@@ -50,19 +50,19 @@ class DatabaseStorage:
     def fetch_known(self):
         cur = self.conn.cursor()
 
+        res = []
         try:
             cur.execute('SELECT mac from known_devices')
             results = cur.fetchall()
+
+            for row in results:
+                mac = row[0]
+                res.append(mac)
+
         except sqlite3.OperationalError:
             logger.error('Something went wrong during query execution:', exc_info=True)
         finally:
             cur.close()
-
-        res = []
-
-        for row in results:
-            mac = row[0]
-            res.append(mac)
 
         return res
 
