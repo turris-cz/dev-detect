@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='dev-detect',
-    version='0.1',
+    version='0.1.dev1',
     author='CZ.NIC, z.s.p.o. (http://www.nic.cz/)',
     author_email='packaging@turris.cz',
     packages=['dev_detect'],
@@ -17,7 +17,8 @@ setup(
     ],
     entry_points={
         'console_scripts': [
-            'dev-detect = dev_detect.__main__:main'
+            'dev-detect-daemon = dev_detect.__main__:main',
+            'dev-detect = dev_detect.cli:main'
         ]
     },
     zip_safe=True,

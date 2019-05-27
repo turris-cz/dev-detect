@@ -66,6 +66,40 @@ class DatabaseStorage:
 
         return res
 
+    def search(self, mac):
+        cur = self.conn.cursor()
+
+        try:
+            cur.execute('SELECT EXISTS(SELECT 1 FROM known_devices WHERE mac=?)', (mac,))
+            res = cur.fetchone()
+            return bool(res[0])
+        except sqlite3.OperationalError:
+            logger.error('Something went wrong during query execution:', exc_info=True)
+        finally:
+            cur.close()
+
+    def remove(self, mac):
+        cur = self.conn.cursor()
+
+        try:
+            cur.execute('DELETE FROM known_devices WHERE mac=?', (mac,))
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.error('Something went wrong during query execution:', exc_info=True)
+        finally:
+            cur.close()
+
+    def clear(self):
+        cur = self.conn.cursor()
+
+        try:
+            cur.execute('DELETE FROM known_devices')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            logger.error('Something went wrong during query execution:', exc_info=True)
+        finally:
+            cur.close()
+
 
 # TODO: more accurate class name?
 class Storage:
@@ -82,3 +116,12 @@ class Storage:
         if mac not in self.known_devices:
             self.known_devices.append(mac)
             self.db_storage.store(mac)
+
+    def search(self, mac):
+        return self.db_storage.search(mac)
+
+    def remove(self, mac):
+        self.db_storage.remove(mac)
+
+    def clear(self):
+        self.db_storage.clear()
