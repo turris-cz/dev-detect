@@ -6,7 +6,7 @@ setup(
     author='CZ.NIC, z.s.p.o. (http://www.nic.cz/)',
     author_email='packaging@turris.cz',
     packages=['dev_detect'],
-    url='https://gitlab.labs.nic.cz/turris/pakon-dev-detect',
+    url='https://gitlab.labs.nic.cz/turris/dev-detect',
     license='COPYING',
     description='Small utility to detect devices on local network',
     long_description=open('README.md').read(),
