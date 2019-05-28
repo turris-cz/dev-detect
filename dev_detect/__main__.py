@@ -7,7 +7,7 @@ import threading
 from euci import EUci
 from pyroute2 import IPRoute
 
-from .storage import Storage
+from .storage import DatabaseStorage
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def main():
     db_path = uci.get_default('dev-detect.storage.db_path', default='/srv/dev-detect/dev-detect.db')
     watched_interfaces = uci.get_default('dev-detect.watchlist.ifaces', default=('br-lan', 'br-guest_turris'))
 
-    storage = Storage(db_path)
+    storage = DatabaseStorage(db_path)
 
     with IPRoute() as ipr:
         interfaces = get_interfaces(ipr, watched_interfaces)

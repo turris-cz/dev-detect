@@ -3,7 +3,7 @@ import re
 import sys
 
 from euci import EUci
-from .storage import Storage
+from .storage import DatabaseStorage
 
 
 def validate_mac_addr_format(mac):
@@ -66,7 +66,7 @@ def main():
     uci = EUci()
     db_path = uci.get_default('dev-detect.storage.db_path', default='/srv/dev-detect/dev-detect.db')
 
-    storage = Storage(db_path)
+    storage = DatabaseStorage(db_path)
 
     parser = setup_argparser()
     parse_arguments(parser.parse_args(), storage)

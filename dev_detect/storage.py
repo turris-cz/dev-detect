@@ -28,7 +28,7 @@ class DatabaseStorage:
 
             if not result:
                 logger.warning('Table is missing. Recreating database schema.')
-                cur.execute('CREATE TABLE known_devices (mac text)')
+                cur.execute('CREATE TABLE known_devices (mac text UNIQUE)')
                 self.conn.commit()
         except sqlite3.OperationalError:
             logger.error('Something went wrong during query execution:', exc_info=True)
@@ -39,7 +39,7 @@ class DatabaseStorage:
         cur = self.conn.cursor()
 
         try:
-            cur.execute('INSERT INTO known_devices (mac) VALUES (?)', (mac, ))
+            cur.execute('INSERT OR IGNORE INTO known_devices (mac) VALUES (?)', (mac, ))
 
             self.conn.commit()
         except sqlite3.OperationalError:
@@ -47,7 +47,7 @@ class DatabaseStorage:
         finally:
             cur.close()
 
-    def fetch_known(self):
+    def get_known(self):
         cur = self.conn.cursor()
 
         res = []
@@ -100,28 +100,3 @@ class DatabaseStorage:
         finally:
             cur.close()
 
-
-# TODO: more accurate class name?
-class Storage:
-    """High level interface for storage that acts as known devices cache"""
-    def __init__(self, db_path):
-        self.db_storage = DatabaseStorage(db_path)
-
-        self.known_devices = self.db_storage.fetch_known()
-
-    def get_known(self):
-        return self.known_devices
-
-    def write_new(self, mac):
-        if mac not in self.known_devices:
-            self.known_devices.append(mac)
-            self.db_storage.store(mac)
-
-    def search(self, mac):
-        return self.db_storage.search(mac)
-
-    def remove(self, mac):
-        self.db_storage.remove(mac)
-
-    def clear(self):
-        self.db_storage.clear()
