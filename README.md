@@ -1,4 +1,4 @@
-## Network device detection
+# Network device detection
 
 Dev-detect is network device detection daemon inspired by now deprecated `pakon-dev-detect`. It is written from scratch using netlink as source of events on network.
 
@@ -13,7 +13,25 @@ Package ships reasonable defaults for turris routers, however users can customiz
 
 There is no foris settings tab yet, so any changes has to be done manually.
 
-### Persistence
+## CLI client 
+
+Package include simple cli interface called `dev-detect-cli` to interact with device database.
+
+You can use one of following commands:
+
+```
+search <MAC>        Search device by MAC address
+remove <MAC>        Delete specified MAC address
+list                List known devices
+clear               Clear/reset database
+```
+
+For full options see help:
+```
+dev-detect-cli --help
+```
+
+## Persistence
 
 `dev-detect` store detected devices into sqlite database in order to remember already discovered devices.
 
@@ -28,7 +46,7 @@ config storage 'storage'
     option db_path   '/path/to/persistent/storage/dev-detect.db'
 ```
 
-### Watch list
+## Watch list
 
 By default `dev-detect` only detect devices on internal lan bridges (`br-lan`, `br-guest_turris`), however it can be configured to check multiple interfaces.
 
