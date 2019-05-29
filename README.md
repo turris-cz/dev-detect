@@ -30,7 +30,7 @@ config storage 'storage'
 
 ### Watch list
 
-By default `dev-detect` only detect devices on internal lan bridge (`br-lan`), however it can be configured to check multiple interfaces.
+By default `dev-detect` only detect devices on internal lan bridges (`br-lan`, `br-guest_turris`), however it can be configured to check multiple interfaces.
 
 To add another network interface to watch list, append `list ifaces <interface>` line to `watchlist` section.
 
