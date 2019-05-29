@@ -15,11 +15,13 @@ There is no foris settings tab yet, so any changes has to be done manually.
 
 ### Persistence
 
-`dev-detect` store detected devices into sqlite database in order to remember already discovered devices in case of service restart. As precaution to wearing out internal storage, database is by default located in RAM, thus will not survive reboot.
+`dev-detect` store detected devices into sqlite database in order to remember already discovered devices.
 
-This behavior is suitable for network where you can expect lots of different clients connecting through your router, e.g. public Wi-Fi AP.
+By default it is stored on internal storage, which is suitable when you expect small number of devices that appears regularly (e.g. home network, small office). 
 
-If you expect small number of devices that appears regularly (e.g. home network, small office), you can store known devices permanently. Just change `db_path` to location on persistent storage (flash drive, external HDD).
+If you want to enable device detection in network where you could expect lots of different clients connecting through your router, e.g. public Wi-Fi AP, it is recommended to store database either on external persistent storage (flash drive, external HDD) or ramdisk as precaution to wearing out internal storage.
+
+Just change `db_path` location in `storage` section.
 
 ```
 config storage 'storage'
