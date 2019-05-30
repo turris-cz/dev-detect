@@ -66,7 +66,7 @@ def process_netlink_message(message, interfaces, storage):
         return
 
     if mac not in storage.get_known():
-        storage.write_new(mac)
+        storage.store(mac)
 
         # interfaces are there just to conform to notify shell script interface
         # TODO: use interface name elsewhere? omit it in notifications completely?
