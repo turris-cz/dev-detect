@@ -11,14 +11,11 @@ Dependencies:
 
 Package ships reasonable defaults for turris routers, however users can customize daemon behavior or scope of it's operation in `uci` config file (`/etc/config/dev-detect`).
 
-There is no foris settings tab yet, so any changes has to be done manually.
-
 ## CLI client 
 
 Package include simple cli interface called `dev-detect-cli` to interact with device database.
 
 You can use one of following commands:
-
 ```
 search <MAC>        Search device by MAC address
 remove <MAC>        Delete specified MAC address
