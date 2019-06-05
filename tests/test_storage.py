@@ -1,8 +1,4 @@
-def test_get_known(storage):
-    """Test that storage return list of mac addresses"""
-    macs = storage.get_known()
-
-    assert isinstance(macs, list)
+import pytest
 
 
 def test_store(storage):
@@ -13,48 +9,49 @@ def test_store(storage):
     assert macs == ['aa:bb:cc:dd:ee:ff']
 
 
-def test_store_multiple(storage):
-    """Test write of multiple records"""
+def test_store_again(storage):
+    """Test that only unique values are stored"""
     storage.store('aa:bb:cc:dd:ee:ff')
-    storage.store('a1:b2:c3:d4:e5:f6')
+    storage.store('aa:bb:cc:dd:ee:ff')
+
     macs = storage.get_known()
 
-    assert macs == ['aa:bb:cc:dd:ee:ff', 'a1:b2:c3:d4:e5:f6']
+    assert macs == ['aa:bb:cc:dd:ee:ff']
 
 
-def test_search(storage):
-    storage.store('aa:bb:cc:dd:ee:ff')
-    res = storage.search('aa:bb:cc:dd:ee:ff')
-
+@pytest.mark.parametrize(
+    'storage, searched',
+    [
+        (['aa:bb:cc:dd:ee:ff'], 'aa:bb:cc:dd:ee:ff'),
+        pytest.param(['aa:bb:cc:dd:ee:ff'], 'a1:b2:c2:d4:e5:f6', marks=pytest.mark.xfail),
+        pytest.param(['aa:bb:cc:dd:ee:ff'], 'aaaa', marks=pytest.mark.xfail),
+    ],
+    indirect=['storage']
+)
+def test_search(storage, searched):
+    res = storage.search(searched)
     assert res is True
 
 
-def test_search_nonexisting(storage):
-    storage.store('aa:bb:cc:dd:ee:ff')
-    res = storage.search('a1:b2:c2:d4:e5:f6')
-
-    assert res is False
-
-
-def test_search_nonsense(storage):
-    storage.store('aa:bb:cc:dd:ee:ff')
-    res = storage.search('aaaa')
-
-    assert res is False
-
-
+@pytest.mark.parametrize(
+    'storage', [('aa:bb:cc:dd:ee:ff',)],
+    indirect=True
+)
 def test_remove(storage):
-    storage.store('aa:bb:cc:dd:ee:ff')
     storage.remove('aa:bb:cc:dd:ee:ff')
     macs = storage.get_known()
 
     assert macs == []
 
 
+@pytest.mark.parametrize(
+    'storage',
+    [
+        ('aa:bb:cc:dd:ee:ff', 'a1:b2:c3:d4:e5:f6',)
+    ],
+    indirect=True
+)
 def test_clear(storage):
-    storage.store('aa:bb:cc:dd:ee:ff')
-    storage.store('a1:b2:c3:d4:e5:f6')
-
     storage.clear()
     macs = storage.get_known()
 
