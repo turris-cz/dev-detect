@@ -64,7 +64,7 @@ def parse_arguments(args, storage):
 
 def main():
     uci = EUci()
-    db_path = uci.get_default('dev-detect.storage.db_path', default='/srv/dev-detect/dev-detect.db')
+    db_path = uci.get('dev-detect', 'storage', 'db_path', dtype=str, default='/srv/dev-detect/dev-detect.db')
 
     storage = DatabaseStorage(db_path)
 
