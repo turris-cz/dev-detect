@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='dev-detect',
-    version='0.1.dev1',
+    version='0.3',
     author='CZ.NIC, z.s.p.o. (http://www.nic.cz/)',
     author_email='packaging@turris.cz',
     packages=['dev_detect'],
