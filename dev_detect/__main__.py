@@ -19,8 +19,13 @@ IPV6 = 10
 REACHABLE = 2
 
 
-# use this old code for time being
-# TODO: use new notification system
+# Use this old code from pakon-dev-detect for time being.
+# dev-detect will probably get packaged and shipped to users sooner than notification system,
+# therefore I guess it is better to use this old function for now than rewritting it
+# piece by piece and then throwing it away later anyway.
+#
+# Notifications are created in external shell script and this is basically wrapper for it.
+# TODO: drop this function and use new notification system instead
 def new_device_notify(mac, iface):
     def new_device_notify_thread(mac, iface):
         time.sleep(5)
