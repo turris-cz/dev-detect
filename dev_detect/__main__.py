@@ -127,11 +127,10 @@ def main():
     storage = DatabaseStorage(db_path)
 
     with IPRoute() as ipr:
-        interfaces = get_interfaces(ipr, watched_interfaces)
-        get_neigbours_from_arp(ipr, interfaces, storage)
-
         ipr.bind()  # subscribe to netlink broadcast
 
+        interfaces = get_interfaces(ipr, watched_interfaces)
+        get_neigbours_from_arp(ipr, interfaces, storage)
         detect_devices(ipr, interfaces, storage)
 
 
