@@ -7,7 +7,7 @@ setup(
     author_email='packaging@turris.cz',
     packages=['dev_detect'],
     url='https://gitlab.labs.nic.cz/turris/dev-detect',
-    license='COPYING',
+    license='GPL-3.0-only',
     description='Small utility to detect devices on local network',
     long_description=open('README.md').read(),
     long_description_content_type="text/markdown",
@@ -21,5 +21,10 @@ setup(
             'dev-detect = dev_detect.cli:main'
         ]
     },
+    classifiers=[
+        'License :: OSI Approved :: GNU General Public License v3 (GPLv3)',
+        'Operating System :: POSIX :: Linux',
+        'Programming Language :: Python :: 3 :: Only',
+    ],
     zip_safe=True,
 )
