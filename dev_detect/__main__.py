@@ -119,10 +119,18 @@ def main():
     else:
         setup_logging()
 
-    uci = EUci()
-
-    db_path = uci.get('dev-detect', 'storage', 'db_path', dtype=str, default='/srv/dev-detect/dev-detect.db')
-    watched_interfaces = uci.get('dev-detect', 'watchlist', 'ifaces', dtype=str, default=('br-lan', 'br-guest_turris'), list=True)
+    with EUci() as uci:
+        db_path = uci.get(
+            'dev-detect', 'storage', 'db_path',
+            dtype=str,
+            default='/srv/dev-detect/dev-detect.db'
+        )
+        watched_interfaces = uci.get(
+            'dev-detect', 'watchlist', 'ifaces',
+            dtype=str,
+            default=('br-lan', 'br-guest_turris'),
+            list=True
+        )
 
     storage = DatabaseStorage(db_path)
 
