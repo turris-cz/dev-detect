@@ -12,6 +12,11 @@ from .storage import DatabaseStorage
 
 logger = logging.getLogger(__name__)
 
+ADDRMAP = {
+    IPV4: '4',
+    IPV6: '6'
+}
+
 
 # Use this old code from pakon-dev-detect for time being.
 # dev-detect will probably get packaged and shipped to users sooner than notification system,
@@ -20,7 +25,7 @@ logger = logging.getLogger(__name__)
 #
 # Notifications are created in external shell script and this is basically wrapper for it.
 # TODO: drop this function and use new notification system instead
-def new_device_notify(mac, iface):
+def new_device_notify(mac, ip, addr_family, iface):
     def new_device_notify_thread(mac, iface):
         time.sleep(5)
         try:
@@ -28,6 +33,10 @@ def new_device_notify(mac, iface):
             subprocess.call([arg.encode('utf-8') for arg in cmd])
         except OSError:
             print("failed to create notification")
+
+    logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
+                iface, mac, ADDRMAP.get(addr_family), ip)
+
     thread = threading.Thread(target=new_device_notify_thread, args=(mac, iface, ))
     thread.daemon = True
     thread.start()
@@ -47,15 +56,6 @@ def get_interfaces(ipr, watched_interfaces):
     return interfaces
 
 
-def ip_version(address_family):
-    if address_family == IPV4:
-        return '4'
-    elif address_family == IPV6:
-        return '6'
-
-    return None
-
-
 def process_netlink_message(message, interfaces, storage):
     mac = message.get_attr('NDA_LLADDR')
     ip = message.get_attr('NDA_DST')
@@ -69,9 +69,7 @@ def process_netlink_message(message, interfaces, storage):
 
         # interfaces are there just to conform to notify shell script interface
         # TODO: use interface name elsewhere? omit it in notifications completely?
-        new_device_notify(mac, interfaces[message['ifindex']])
-
-        logger.info("New device detected MAC: %s | IPv%s address: %s", mac, ip_version(message), ip)
+        new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
 
 
 def get_neigbours_from_arp(ipr, interfaces, storage):
