@@ -7,16 +7,10 @@ import threading
 from euci import EUci
 from pyroute2 import IPRoute
 
+from .constants import IPV4, IPV6, REACHABLE
 from .storage import DatabaseStorage
 
 logger = logging.getLogger(__name__)
-
-# netlink constants
-# for details see netlink kernel header files
-IPV4 = 2
-IPV6 = 10
-
-REACHABLE = 2
 
 
 # Use this old code from pakon-dev-detect for time being.
