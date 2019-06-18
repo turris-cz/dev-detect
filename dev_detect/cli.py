@@ -6,7 +6,7 @@ from euci import EUci
 from .storage import DatabaseStorage
 
 
-def validate_mac_addr_format(mac):
+def valid_mac_addr_format(mac):
     pattern = '^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
     m = re.match(pattern, mac)
 
@@ -39,9 +39,17 @@ def print_devices(macs):
         print(m)
 
 
-def parse_arguments(args, storage):
+def main():
+    uci = EUci()
+    db_path = uci.get('dev-detect', 'storage', 'db_path', dtype=str, default='/srv/dev-detect/dev-detect.db')
+
+    storage = DatabaseStorage(db_path)
+
+    parser = setup_argparser()
+    args = parser.parse_args()
+
     if args.action == 'search':
-        if not validate_mac_addr_format(args.mac):
+        if not valid_mac_addr_format(args.mac):
             print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
             sys.exit(1)
 
@@ -51,7 +59,7 @@ def parse_arguments(args, storage):
         else:
             print('Device not found')
     elif args.action == 'remove':
-        if not validate_mac_addr_format(args.mac):
+        if not valid_mac_addr_format(args.mac):
             print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
             sys.exit(1)
 
@@ -60,16 +68,6 @@ def parse_arguments(args, storage):
         print_devices(storage.get_known())
     elif args.action == 'clear':
         storage.clear()
-
-
-def main():
-    uci = EUci()
-    db_path = uci.get('dev-detect', 'storage', 'db_path', dtype=str, default='/srv/dev-detect/dev-detect.db')
-
-    storage = DatabaseStorage(db_path)
-
-    parser = setup_argparser()
-    parse_arguments(parser.parse_args(), storage)
 
 
 if __name__ == '__main__':
