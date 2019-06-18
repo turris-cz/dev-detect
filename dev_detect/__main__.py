@@ -77,9 +77,8 @@ def get_neigbours_from_arp(ipr, interfaces, storage):
     for nic in interfaces:
         devices = ipr.get_neighbours(ifindex=nic)
 
-        for dev in devices:
-            if dev['state'] == REACHABLE:
-                process_netlink_message(dev, interfaces, storage)
+        for dev in filter(lambda dev: dev['state'] == REACHABLE, devices):
+            process_netlink_message(dev, interfaces, storage)
 
 
 def detect_devices(ipr, interfaces, storage):
@@ -94,7 +93,7 @@ def detect_devices(ipr, interfaces, storage):
                 process_netlink_message(message, interfaces, storage)
 
 
-def setup_logging(loglevel=logging.INFO):
+def setup_logging(loglevel):
     logging_format = "%(levelname)s: %(message)s"
     logging.basicConfig(level=loglevel, format=logging_format)
     logger.setLevel(loglevel)
@@ -106,10 +105,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.debug:
-        setup_logging(logging.DEBUG)
-    else:
-        setup_logging()
+    setup_logging(logging.DEBUG if args.debug else logging.INFO)
 
     with EUci() as uci:
         db_path = uci.get(
