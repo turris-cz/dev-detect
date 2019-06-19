@@ -33,10 +33,42 @@ def setup_argparser():
     return parser
 
 
-def print_devices(macs):
+def list(storage, args):
     print('Known devices:')
-    for m in macs:
+    for m in storage.get_known():
         print(m)
+
+
+def search(storage, args):
+    if not valid_mac_addr_format(args.mac):
+        print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
+        sys.exit(1)
+
+    res = storage.search(args.mac)
+    if res:
+        print('Device with MAC address {} is in database'.format(args.mac))
+    else:
+        print('Device not found')
+
+
+def remove(storage, args):
+    if not valid_mac_addr_format(args.mac):
+        print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
+        sys.exit(1)
+
+    storage.remove(args.mac)
+
+
+def clear(storage, args):
+    storage.clear()
+
+
+action_map = {
+    'list': list,
+    'search': search,
+    'remove': remove,
+    'clear': clear
+}
 
 
 def main():
@@ -48,26 +80,7 @@ def main():
     parser = setup_argparser()
     args = parser.parse_args()
 
-    if args.action == 'search':
-        if not valid_mac_addr_format(args.mac):
-            print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
-            sys.exit(1)
-
-        res = storage.search(args.mac)
-        if res:
-            print('Device with MAC address {} is in database'.format(args.mac))
-        else:
-            print('Device not found')
-    elif args.action == 'remove':
-        if not valid_mac_addr_format(args.mac):
-            print("Incorrect format of MAC address. Please use format 'aa:bb:cc:dd:ee:ff'")
-            sys.exit(1)
-
-        storage.remove(args.mac)
-    elif args.action == 'list':
-        print_devices(storage.get_known())
-    elif args.action == 'clear':
-        storage.clear()
+    action_map[args.action](storage, args)
 
 
 if __name__ == '__main__':
