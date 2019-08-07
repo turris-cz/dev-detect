@@ -13,7 +13,7 @@ setup(
     long_description_content_type="text/markdown",
     install_requires=[
         'pyroute2',
-        'pyuci',
+        'pyuci @ git+https://gitlab.labs.nic.cz/turris/pyuci.git',
     ],
     entry_points={
         'console_scripts': [
