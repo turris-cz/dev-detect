@@ -13,7 +13,7 @@ Package ships reasonable defaults for turris routers, however users can customiz
 
 ## CLI client 
 
-Package include simple cli interface called `dev-detect-cli` to interact with device database.
+Package include simple cli interface called `dev-detect` to interact with device database.
 
 You can use one of following commands:
 ```
@@ -25,12 +25,12 @@ clear               Clear/reset database
 
 For full options see help:
 ```
-dev-detect-cli --help
+dev-detect --help
 ```
 
 ## Persistence
 
-`dev-detect` store detected devices into sqlite database in order to remember already discovered devices.
+Detected devices are stored in sqlite database in order to remember already discovered devices.
 
 By default it is stored on internal storage, which is suitable when you expect small number of devices that appears regularly (e.g. home network, small office). 
 
