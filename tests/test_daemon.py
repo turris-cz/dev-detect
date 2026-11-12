@@ -1,10 +1,12 @@
 import errno
 import logging
 import os
+import threading
 
 import pytest
 
 import dev_detect.__main__ as daemon
+from dev_detect import notify
 from dev_detect.storage import DatabaseStorage, StorageError
 
 MAC = '3e:f1:18:4d:d9:23'
@@ -44,9 +46,19 @@ class FailingStorage:
 
 @pytest.fixture
 def notified(monkeypatch):
+    """Notifications sent, each created at once"""
     sent = []
-    monkeypatch.setattr(daemon, 'new_device_notify', lambda mac, ip, family, iface: sent.append(mac))
+
+    def new_device_notify(mac, ip, family, iface, on_reported=None):
+        sent.append(mac)
+        if on_reported:
+            on_reported(notify.Device(mac, iface))
+    monkeypatch.setattr(daemon, 'new_device_notify', new_device_notify)
     return sent
+
+
+def failing_tracker(storage, **kwargs):
+    return daemon.DeviceTracker(storage, thread_storage=lambda: storage, **kwargs)
 
 
 # every address of a device and every state change produces RTM_NEWNEIGH
@@ -79,7 +91,7 @@ def test_messages_without_addresses_are_ignored(tmp_path, notified):
 
 @pytest.mark.parametrize('search_fails', [False, True], ids=['read-only', 'unreadable'])
 def test_device_is_reported_once_when_it_cannot_be_stored(notified, search_fails):
-    tracker = daemon.DeviceTracker(FailingStorage(search_fails))
+    tracker = failing_tracker(FailingStorage(search_fails))
     feed(tracker, EVENTS + [Message(OTHER_MAC, '192.168.1.51', family=2)] + EVENTS)
 
     assert notified == [MAC, OTHER_MAC]
@@ -87,7 +99,7 @@ def test_device_is_reported_once_when_it_cannot_be_stored(notified, search_fails
 
 def test_unsaved_devices_are_stored_once_database_works(notified):
     storage = FailingStorage()
-    tracker = daemon.DeviceTracker(storage)
+    tracker = failing_tracker(storage)
     feed(tracker, EVENTS)
     storage.broken = False
     feed(tracker, [Message(OTHER_MAC, '192.168.1.51', family=2)] + EVENTS)
@@ -357,6 +369,29 @@ def test_other_netlink_errors_are_raised(tmp_path):
         daemon.detect_devices(ipr, INTERFACES, ('br-lan',), tracker, ipr)
 
 
+def test_device_is_stored_after_its_notification(tmp_path):
+    """In the notification thread, which needs its own connection"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path))
+    assert tracker.is_new(MAC)
+    assert not tracker.is_new(MAC)  # pending
+    assert DatabaseStorage(db_path).get_known() == []
+
+    thread = threading.Thread(target=tracker.device_reported, args=(notify.Device(MAC, 'br-lan'),))
+    thread.start()
+    thread.join()
+
+    assert DatabaseStorage(db_path).get_known() == [MAC]
+    assert not tracker.pending
+    assert not tracker.is_new(MAC)
+
+
+def test_device_is_reported_again_when_daemon_stopped_before_notification(tmp_path):
+    db_path = str(tmp_path / 'dev-detect.db')
+    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC)  # then the daemon stops
+    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC)
+
+
 def test_unsaved_device_is_stored_once_database_works_again(notified, monkeypatch):
     """Even when no other device is stored meanwhile"""
     clock = [1000.0]
@@ -365,7 +400,7 @@ def test_unsaved_device_is_stored_once_database_works_again(notified, monkeypatc
     attempts = []
     store = storage.store
     storage.store = lambda mac: attempts.append(mac) or store(mac)
-    tracker = daemon.DeviceTracker(storage)
+    tracker = failing_tracker(storage)
     for _ in range(10):  # a device present for 10 minutes
         feed(tracker, EVENTS)
         clock[0] += 60
@@ -379,6 +414,63 @@ def test_unsaved_device_is_stored_once_database_works_again(notified, monkeypatc
     assert MAC in storage.macs and not tracker.unsaved
 
 
+@pytest.fixture
+def notifications(monkeypatch):
+    """Notifications waiting to be created, their callbacks are called by the test"""
+    waiting = []
+
+    def new_device_notify(mac, ip, family, iface, on_reported=None):
+        waiting.append((notify.Device(mac, iface), on_reported))
+    monkeypatch.setattr(daemon, 'new_device_notify', new_device_notify)
+    return waiting
+
+
+def test_device_reported_when_database_cannot_be_read_is_stored_after_its_notification(notifications):
+    """Not by storing the devices that could not be stored meanwhile"""
+    storage = FailingStorage(search_fails=True)
+    stored = []
+    store = storage.store
+    storage.store = lambda mac: stored.append(mac) or store(mac)
+    tracker = failing_tracker(storage)
+    feed(tracker, EVENTS)
+    storage.broken = False
+    feed(tracker, EVENTS + [Message(OTHER_MAC, '192.168.1.51', family=2)])
+    (first, on_first), (other, on_other) = notifications
+
+    on_other(other)
+    assert stored == [OTHER_MAC]
+    on_first(first)
+    assert stored == [OTHER_MAC, MAC]
+    assert not tracker.pending and not tracker.unsaved
+
+
+def test_device_is_claimed_once(tmp_path, notified, monkeypatch):
+    """E.g. by another thread while the database was read"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage)
+    search = storage.search
+
+    def search_while_claimed(mac):
+        tracker.pending.add(mac)
+        return search(mac)
+    monkeypatch.setattr(storage, 'search', search_while_claimed)
+
+    assert not tracker.is_new(MAC)
+
+
+def test_reported_device_that_cannot_be_stored_for_unexpected_reason(notified, caplog):
+    """It must not become unknown, it would be reported again and again"""
+    class BrokenStorage(FailingStorage):
+        def store(self, mac):
+            raise RuntimeError('unexpected')
+    tracker = failing_tracker(BrokenStorage())
+    feed(tracker, EVENTS * 2)
+
+    assert notified == [MAC]
+    assert not tracker.pending and tracker.unsaved == {MAC}
+    assert 'Cannot record device' in caplog.text
+
+
 @pytest.fixture(autouse=True)
 def messages_waiting(monkeypatch):
     """Fake netlink sockets have no file descriptor to wait for, they always have messages"""
@@ -390,7 +482,7 @@ def test_unsaved_device_is_stored_also_when_no_message_comes(notified, monkeypat
     clock = [1000.0]
     monkeypatch.setattr(daemon.time, 'monotonic', lambda: clock[0])
     storage = FailingStorage()
-    tracker = daemon.DeviceTracker(storage)
+    tracker = failing_tracker(storage)
     feed(tracker, EVENTS[:1])  # reported, cannot be stored
     storage.broken = False
     timeouts = [False, False]

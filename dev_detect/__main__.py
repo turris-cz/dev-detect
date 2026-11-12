@@ -3,10 +3,10 @@ import errno
 import logging
 import os
 import select
-import subprocess
-import time
 import threading
+import time
 
+from . import notify
 from .constants import DEVICE_STATES, IPV4, IPV6, NTF_PROXY, RTMGRP_LINK, RTMGRP_NEIGH
 from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
@@ -27,28 +27,10 @@ ADDRMAP = {
 }
 
 
-# Use this old code from pakon-dev-detect for time being.
-# dev-detect will probably get packaged and shipped to users sooner than notification system,
-# therefore I guess it is better to use this old function for now than rewritting it
-# piece by piece and then throwing it away later anyway.
-#
-# Notifications are created in external shell script and this is basically wrapper for it.
-# TODO: drop this function and use new notification system instead
-def new_device_notify(mac, ip, addr_family, iface):
-    def new_device_notify_thread(mac, iface):
-        time.sleep(5)
-        try:
-            cmd = ["/usr/libexec/notify_new_device.sh", mac, iface]
-            subprocess.call([arg.encode('utf-8') for arg in cmd])
-        except OSError:
-            print("failed to create notification")
-
+def new_device_notify(mac, ip, addr_family, iface, on_reported=None):
     logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
                 iface, mac, ADDRMAP.get(addr_family), ip)
-
-    thread = threading.Thread(target=new_device_notify_thread, args=(mac, iface, ))
-    thread.daemon = True
-    thread.start()
+    notify.new_device(mac, ip, iface, on_reported)
 
 
 def get_interfaces(ipr, watched_interfaces):
@@ -102,27 +84,70 @@ class DeviceTracker:
     `dev-detect remove` is reported again. A device that cannot be stored is
     kept in memory instead, so that it is reported only once even when the
     database is not writable, and stored once the database works again.
+
+    A reported device is stored only once its notification was created (or
+    creating it failed); until then it is pending in memory. If the daemon
+    stops meanwhile, the device is reported again after the start instead of
+    never.
+
+    States of a device that is not in the database:
+    - unknown: reported when it appears, then pending (is_new());
+    - pending: its notification is being created; then stored, or unsaved if
+      it cannot be stored (device_reported());
+    - unsaved: kept in memory, stored once the database works again.
+    A device removed by `dev-detect remove` while pending is stored again
+    after its notification, as it was reported.
     """
-    def __init__(self, storage):
+    def __init__(self, storage, thread_storage=None):
         self.storage = storage
+        # storage for notification threads, a connection cannot be shared by threads
+        self.thread_storage = thread_storage or (lambda: DatabaseStorage(storage.db_path))
+        self.lock = threading.Lock()  # for unsaved and pending, used by notification threads too
         self.unsaved = set()
+        self.pending = set()  # devices whose notification was not created yet
         self.unsaved_retried = None  # when storing unsaved devices was last tried (monotonic)
 
     def is_new(self, mac):
-        if mac in self.unsaved:
+        """Is the device new? A new device is pending until device_reported() is called."""
+        with self.lock:
+            if mac in self.pending:
+                return False
+            unsaved = mac in self.unsaved
+        if unsaved:
             self.retry_unsaved()
             return False
 
         try:
             if self.storage.search(mac):
                 return False
-            self.storage.store(mac)
-        except StorageError as e:
-            logger.error('Cannot record device %s, it will not be reported again until restart: %s', mac, e)
-            self.unsaved.add(mac)
-        else:
-            self._store_unsaved()
+        except StorageError as e:  # rather reported than missed
+            logger.error('Cannot find out whether device %s is known, it is treated as new: %s', mac, e)
+        with self.lock:  # claim, the database is not read under the lock
+            if mac in self.pending or mac in self.unsaved:
+                return False
+            self.pending.add(mac)
         return True
+
+    def device_reported(self, device):
+        """Store a reported device (runs in the notification thread)"""
+        storage = self.thread_storage()
+        try:
+            storage.store(device.mac)
+        except Exception as e:  # not only StorageError: never unknown again, it would be reported again and again
+            self._keep_unsaved(device.mac, e)
+        else:
+            self._store_unsaved(storage)
+        finally:
+            if storage is not self.storage:
+                storage.close()
+            with self.lock:
+                self.pending.discard(device.mac)
+
+    def _keep_unsaved(self, mac, error):
+        logger.error('Cannot record device %s, it will not be reported again until restart: %s', mac, error,
+                     exc_info=not isinstance(error, StorageError))
+        with self.lock:
+            self.unsaved.add(mac)
 
     def retry_unsaved(self):
         """Store devices that could not be stored, if the database works again
@@ -138,14 +163,18 @@ class DeviceTracker:
         self.unsaved_retried = now
         self._store_unsaved()
 
-    def _store_unsaved(self):
+    def _store_unsaved(self, storage=None):
         """Database works again, store devices that could not be stored before"""
-        for mac in list(self.unsaved):
+        with self.lock:
+            unsaved = list(self.unsaved)
+        for mac in unsaved:
             try:
-                self.storage.store(mac)
-            except StorageError:
+                (storage or self.storage).store(mac)
+            except Exception:
+                logger.debug('Cannot store device %s yet', mac, exc_info=True)
                 return
-            self.unsaved.discard(mac)
+            with self.lock:
+                self.unsaved.discard(mac)
 
 
 def is_device(message, interfaces):
@@ -176,9 +205,8 @@ def process_netlink_message(message, interfaces, tracker):
         return
 
     if tracker.is_new(mac):
-        # interfaces are there just to conform to notify shell script interface
-        # TODO: use interface name elsewhere? omit it in notifications completely?
-        new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
+        new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']],
+                          on_reported=tracker.device_reported)
 
 
 def scan_neighbours(scanner, interfaces, tracker):

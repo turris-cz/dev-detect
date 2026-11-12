@@ -8,6 +8,7 @@ Dependencies:
 * python3-sqlite3
 * python3-uci
 * ouidb - get device vendors based on MAC address
+* create_notification (user-notify) - create notifications
 
 Package ships reasonable defaults for turris routers, however users can customize daemon behavior or scope of it's operation in `uci` config file (`/etc/config/dev-detect`).
 
@@ -27,6 +28,23 @@ For full options see help:
 ```
 dev-detect --help
 ```
+
+## Notifications
+
+New devices are reported through the Turris notification system (reForis, e-mail, ntfy), with all addresses the device uses and the hostname from its DHCP lease:
+
+```
+New device on network lan: Mac
+MAC address: 3e:f1:18:4d:d9:23 (randomized address, vendor unknown)
+IPv4: 192.168.1.50
+IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac
+```
+
+The notification is created once the hostname is known, usually 5 to 10 seconds after the device appears. A device without a hostname is reported after about half a minute.
+
+The vendor is looked up by `ouidb`. Devices using a private (randomized) MAC address have no vendor and may be reported again when their address changes.
+
+A device is stored as known once its notification is created, or once creating it failed (the error is logged, and the device is not reported again). If the daemon stops before (restart, crash, reboot), the device is reported again after it starts. When the database cannot be written, reported devices are kept in memory and stored once it works again, so they are not reported repeatedly; only a restart of the daemon meanwhile makes them reported again.
 
 ## Persistence
 
