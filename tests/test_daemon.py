@@ -1,7 +1,10 @@
 import errno
 import logging
 import os
+import sqlite3
+import sys
 import threading
+import types
 
 import pytest
 
@@ -25,22 +28,38 @@ class Message(dict):
         return self.attrs.get(name)
 
 
+READONLY = StorageError('/srv/dev-detect/dev-detect.db: SQLITE_READONLY: attempt to write a readonly database')
+
+
 class FailingStorage:
-    """Storage that can neither be read nor written, until fixed"""
-    def __init__(self, search_fails=False):
-        self.search_fails = search_fails
+    """Storage that cannot be written (nor read with read_fails), until fixed"""
+    def __init__(self, read_fails=False):
+        self.read_fails = read_fails
         self.broken = True
-        self.macs = set()
+        self.networks = {}  # mac -> interfaces
+        self.stored = []
+        self.details = {}  # mac -> (name, hostname)
+        self.touched = []
 
-    def search(self, mac):
-        if self.broken and self.search_fails:
+    def seen(self, mac, ifaces, per_network=True):
+        if self.broken and self.read_fails:
             raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_IOERR')
-        return mac in self.macs
+        if mac not in self.networks or per_network and not self.networks[mac] & set(ifaces):
+            return None
+        return 0
 
-    def store(self, mac):
+    def touch(self, mac, ifaces):
+        self.touched.append(mac)
         if self.broken:
-            raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_READONLY: attempt to write a readonly database')
-        self.macs.add(mac)
+            raise READONLY
+
+    def store(self, mac, iface, name=None, hostname=None, aliases=()):
+        if self.broken:
+            raise READONLY
+        self.networks.setdefault(mac, set()).add(iface)
+        self.stored.append((mac, iface))
+        if name or hostname or mac not in self.details:
+            self.details[mac] = (name, hostname)
         return True
 
 
@@ -89,9 +108,9 @@ def test_messages_without_addresses_are_ignored(tmp_path, notified):
     assert notified == []
 
 
-@pytest.mark.parametrize('search_fails', [False, True], ids=['read-only', 'unreadable'])
-def test_device_is_reported_once_when_it_cannot_be_stored(notified, search_fails):
-    tracker = failing_tracker(FailingStorage(search_fails))
+@pytest.mark.parametrize('read_fails', [False, True], ids=['read-only', 'unreadable'])
+def test_device_is_reported_once_when_it_cannot_be_stored(notified, read_fails):
+    tracker = failing_tracker(FailingStorage(read_fails))
     feed(tracker, EVENTS + [Message(OTHER_MAC, '192.168.1.51', family=2)] + EVENTS)
 
     assert notified == [MAC, OTHER_MAC]
@@ -105,7 +124,7 @@ def test_unsaved_devices_are_stored_once_database_works(notified):
     feed(tracker, [Message(OTHER_MAC, '192.168.1.51', family=2)] + EVENTS)
 
     assert notified == [MAC, OTHER_MAC]
-    assert storage.macs == {MAC, OTHER_MAC}
+    assert sorted(storage.stored) == [(MAC, 'br-lan'), (OTHER_MAC, 'br-lan')]  # with the interface
     assert not tracker.unsaved
 
 
@@ -124,7 +143,7 @@ def test_removed_device_is_reported_again(tmp_path, notified):
 def test_read_only_database_file(tmp_path, notified):
     db_path = str(tmp_path / 'dev-detect.db')
     writer = DatabaseStorage(db_path)
-    writer.store(OTHER_MAC)
+    writer.store(OTHER_MAC, 'br-lan')
     writer.close()
     os.chmod(db_path, 0o444)
 
@@ -139,7 +158,7 @@ def test_open_storage_creates_directory(tmp_path):
     db_path = tmp_path / 'srv' / 'dev-detect' / 'dev-detect.db'
     storage = daemon.open_storage(str(db_path))
 
-    assert storage.store(MAC)
+    assert storage.store(MAC, 'br-lan')
     assert db_path.exists()
     storage.close()
 
@@ -373,45 +392,487 @@ def test_device_is_stored_after_its_notification(tmp_path):
     """In the notification thread, which needs its own connection"""
     db_path = str(tmp_path / 'dev-detect.db')
     tracker = daemon.DeviceTracker(DatabaseStorage(db_path))
-    assert tracker.is_new(MAC)
-    assert not tracker.is_new(MAC)  # pending
-    assert DatabaseStorage(db_path).get_known() == []
+    assert tracker.is_new(MAC, 'br-lan')
+    assert not tracker.is_new(MAC, 'br-lan')  # pending
+    assert DatabaseStorage(db_path).devices() == []
+    device = notify.Device(MAC, 'br-lan')
+    device.hostname = 'Mac'
 
-    thread = threading.Thread(target=tracker.device_reported, args=(notify.Device(MAC, 'br-lan'),))
+    thread = threading.Thread(target=tracker.device_reported, args=(device,))
     thread.start()
     thread.join()
 
-    assert DatabaseStorage(db_path).get_known() == [MAC]
+    assert [(row[0], row[2], row[5]) for row in DatabaseStorage(db_path).devices()] == [(MAC, 'br-lan', 'Mac')]
     assert not tracker.pending
-    assert not tracker.is_new(MAC)
+    assert not tracker.is_new(MAC, 'br-lan')
 
 
 def test_device_is_reported_again_when_daemon_stopped_before_notification(tmp_path):
     db_path = str(tmp_path / 'dev-detect.db')
-    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC)  # then the daemon stops
-    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC)
+    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC, 'br-lan')  # then the daemon stops
+    assert daemon.DeviceTracker(DatabaseStorage(db_path)).is_new(MAC, 'br-lan')
 
 
-def test_unsaved_device_is_stored_once_database_works_again(notified, monkeypatch):
-    """Even when no other device is stored meanwhile"""
-    clock = [1000.0]
-    monkeypatch.setattr(daemon.time, 'monotonic', lambda: clock[0])
+@pytest.fixture
+def clock(monkeypatch):
+    """Wall clock and monotonic clock, moved by the test"""
+    now = [1700000000.0]
+    monkeypatch.setattr(daemon.time, 'time', lambda: now[0])
+    monkeypatch.setattr(daemon.time, 'monotonic', lambda: now[0])
+    return now
+
+
+def recorded_touches(storage, clock):
+    touched = []
+    original_touch = storage.touch
+
+    def touch(mac, ifaces):
+        touched.append(clock[0])
+        original_touch(mac, ifaces)
+    storage.touch = touch
+    return touched
+
+
+def test_last_seen_is_written_at_most_once_per_interval(tmp_path, clock):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    touched = recorded_touches(storage, clock)
+    tracker = daemon.DeviceTracker(storage)
+
+    for _ in range(3):
+        assert not tracker.is_new(MAC, 'br-lan')
+        clock[0] += 60
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    assert not tracker.is_new(MAC, 'br-lan')
+    assert not tracker.is_new(MAC, 'br-lan')
+
+    assert touched == [1700000180.0 + daemon.LAST_SEEN_INTERVAL]
+    assert [row[4] for row in storage.devices()] == [1700000180 + daemon.LAST_SEEN_INTERVAL]
+
+
+def test_last_seen_is_not_written_again_after_restart(tmp_path, clock):
+    """The interval is counted from the stored time, not from the start of the daemon"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(MAC, 'br-lan')
+    clock[0] += 3600
+    storage = DatabaseStorage(db_path)
+    touched = recorded_touches(storage, clock)
+
+    assert not daemon.DeviceTracker(storage).is_new(MAC, 'br-lan')
+    assert touched == []
+
+
+def test_failed_last_seen_write_is_not_repeated_at_once(clock):
     storage = FailingStorage()
-    attempts = []
-    store = storage.store
-    storage.store = lambda mac: attempts.append(mac) or store(mac)
+    storage.networks[MAC] = {'br-lan'}
     tracker = failing_tracker(storage)
-    for _ in range(10):  # a device present for 10 minutes
-        feed(tracker, EVENTS)
-        clock[0] += 60
-    storage.broken = False
-    for _ in range(10):
-        feed(tracker, EVENTS)
-        clock[0] += 60
+
+    for _ in range(3):
+        assert not tracker.is_new(MAC, 'br-lan')
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    assert not tracker.is_new(MAC, 'br-lan')
+
+    assert storage.touched == [MAC, MAC]
+
+
+def test_last_seen_is_written_only_when_presence_is_confirmed(tmp_path, clock):
+    """Entries of departed devices stay STALE in the neighbour table for long"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    touched = recorded_touches(storage, clock)
+    tracker = daemon.DeviceTracker(storage)
+    feed(tracker, [Message(MAC, '192.168.1.50', family=2, state=0x04)])  # STALE
+    assert touched == []
+    feed(tracker, [Message(MAC, '192.168.1.50', family=2, state=0x02)])  # REACHABLE
+    assert touched == [clock[0]]
+
+
+def test_network_of_device_known_everywhere_is_recorded(tmp_path, notified):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.add(MAC, 'laptop')
+    feed(daemon.DeviceTracker(storage, per_network=True), EVENTS)
+
+    assert [row[:3] for row in storage.devices()] == [(MAC, 'laptop', ''), (MAC, 'laptop', 'br-lan')]
+    assert notified == []
+
+
+@pytest.fixture
+def learned(monkeypatch):
+    devices = []
+    monkeypatch.setattr(daemon.notify, 'learned_devices', devices.extend)
+    return devices
+
+
+def start(tracker, *neighbours):
+    """What main() does before waiting for broadcast messages"""
+    tracker.start_learning()
+    ipr = FakeIPRoute(links=[Link('RTM_NEWLINK', IFINDEX, 'br-lan')], neighbours=list(neighbours))
+    daemon.synchronize(ipr, {}, ('br-lan',), tracker)
+
+
+def test_devices_present_at_start_with_empty_database_are_learned(tmp_path, notified, learned):
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')))
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+    feed(tracker, [Message('02:00:00:00:00:99', '192.168.1.99', family=2)])
+
+    assert learned == [(MAC, ['br-lan'], None), (OTHER_MAC, ['br-lan'], None)]
+    assert notified == ['02:00:00:00:00:99']
+    assert tracker.storage.search(MAC) and tracker.storage.search(OTHER_MAC)
+
+
+def test_nothing_is_learned_with_known_devices(tmp_path, notified, learned):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(storage)
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+
+    assert learned == []
+    assert notified == [OTHER_MAC]
+
+
+class ConfigEUci:
+    """Stand-in for euci.EUci with given dev-detect options, defaults otherwise"""
+    def __init__(self, **options):
+        self.options = options
+
+    def get(self, config, section, option, dtype=str, default=None, list=False):
+        assert config == 'dev-detect'
+        return self.options.get(option, default)
+
+
+def test_config_defaults():
+    config = daemon.read_config(ConfigEUci())
+
+    assert config == {
+        'db_path': '/srv/dev-detect/dev-detect.db',
+        'interfaces': ('br-lan', 'br-guest-turris', 'br-guest_turris'),
+        'learn_on_empty': True,
+        'known_static_leases': True,
+        'per_network': True,
+    }
+    assert not daemon.read_config(ConfigEUci(learn_on_empty=False))['learn_on_empty']
+
+
+def test_hostnames_of_learned_devices_are_stored(tmp_path, notified, learned, monkeypatch):
+    leases = tmp_path / 'dhcp.leases'
+    leases.write_text('1731440000 3e:f1:18:4d:d9:23 192.168.1.50 Mac 01:3e:f1:18:4d:d9:23\n')
+    monkeypatch.setattr(notify, 'DNSMASQ_LEASES', str(leases))
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')))
+    start(tracker, Message(MAC, '192.168.1.50', family=2), Message(OTHER_MAC, '192.168.1.51', family=2))
+
+    assert learned == [(MAC, ['br-lan'], 'Mac'), (OTHER_MAC, ['br-lan'], None)]
+    assert [(row[0], row[5]) for row in tracker.storage.devices()] == [(MAC, 'Mac'), (OTHER_MAC, None)]
+
+
+class DhcpEUci:
+    """Stand-in for euci.EUci with static leases in /etc/config/dhcp"""
+    reads = 0
+    sections = {
+        'dnsmasq': ('dnsmasq', {'domain': 'lan'}),
+        'printer': ('host', {'mac': '02:00:00:00:00:01', 'name': 'printer', 'ip': '192.168.1.200'}),
+        'cfg0a1b2c': ('host', {'mac': ('AA:BB:CC:DD:EE:FF',)}),
+        'tv': ('host', {'mac': '02:00:00:00:00:02 02-00-00-00-00-03', 'name': 'tv'}),
+    }
+
+    def __enter__(self):
+        DhcpEUci.reads += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, config, section=None, option=None, default=None, **kwargs):
+        assert config == 'dhcp'
+        if section is None:
+            return {name: options for name, (_, options) in self.sections.items()}
+        return self.sections[section][0]
+
+
+@pytest.fixture
+def dhcp(monkeypatch, tmp_path):
+    DhcpEUci.reads = 0
+    monkeypatch.setitem(sys.modules, 'euci', types.SimpleNamespace(EUci=DhcpEUci))
+    monkeypatch.setattr(daemon, 'DHCP_CONFIG', str(tmp_path / 'dhcp'))  # missing: read every time
+    monkeypatch.setattr(daemon, '_static_leases', (None, {}))
+    return DhcpEUci
+
+
+@pytest.mark.parametrize('mac, name', [
+    ('02:00:00:00:00:01', 'printer'),
+    ('aa:bb:cc:dd:ee:ff', ''),
+    ('02:00:00:00:00:03', 'tv'),
+    ('02:00:00:00:00:04', None),
+])
+def test_static_lease(dhcp, mac, name):
+    assert daemon.static_lease(mac) == name
+
+
+def test_static_leases_are_read_again_only_after_change(tmp_path, dhcp):
+    config = tmp_path / 'dhcp'
+    config.write_text("config host 'printer'\n")
+    assert daemon.static_lease('02:00:00:00:00:01') == 'printer'
+    assert daemon.static_lease('02:00:00:00:00:04') is None
+    assert dhcp.reads == 1
+
+    config.write_text("config host 'printer'\nconfig host 'tv'\n")
+    assert daemon.static_lease('02:00:00:00:00:02') == 'tv'
+    assert dhcp.reads == 2
+
+
+def change_dhcp_config(config, monkeypatch, **sections):
+    """Write /etc/config/dhcp with other host sections, as uci commit does: a new file renamed over it"""
+    monkeypatch.setattr(DhcpEUci, 'sections', sections)
+    new = config.with_name('.dhcp.uci-new')
+    new.write_text(''.join("config host '{}'\n".format(name) for name in sections) + '# ' + str(sections))
+    new.replace(config)
+
+
+def test_removed_static_lease_is_not_known(tmp_path, dhcp, monkeypatch):
+    config = tmp_path / 'dhcp'
+    change_dhcp_config(config, monkeypatch, printer=('host', {'mac': '02:00:00:00:00:01', 'name': 'printer'}))
+    assert daemon.static_lease('02:00:00:00:00:01') == 'printer'
+
+    change_dhcp_config(config, monkeypatch)
+    assert daemon.static_lease('02:00:00:00:00:01') is None
+
+
+def test_changed_mac_of_static_lease(tmp_path, dhcp, monkeypatch):
+    config = tmp_path / 'dhcp'
+    change_dhcp_config(config, monkeypatch, printer=('host', {'mac': '02:00:00:00:00:01', 'name': 'printer'}))
+    assert daemon.static_lease('02:00:00:00:00:01') == 'printer'
+
+    change_dhcp_config(config, monkeypatch, printer=('host', {'mac': '02:00:00:00:00:09', 'name': 'printer'}))
+    assert daemon.static_lease('02:00:00:00:00:01') is None
+    assert daemon.static_lease('02:00:00:00:00:09') == 'printer'
+
+
+def test_mac_in_more_static_leases(tmp_path, dhcp, monkeypatch):
+    change_dhcp_config(tmp_path / 'dhcp', monkeypatch, printer=('host', {'mac': '02:00:00:00:00:01', 'name': 'printer'}),
+                       copy=('host', {'mac': '02-00-00-00-00-01', 'name': 'copy'}))
+
+    assert daemon.static_lease('02:00:00:00:00:01') == 'printer'  # the first one, like dnsmasq
+
+
+@pytest.mark.parametrize('options', [
+    {'enable': '0'}, {'enable': 'no'}, {'enable': 'off'}, {'enable': 'false'}, {'enable': 'disabled'}, {'ip': 'ignore'},
+])
+def test_disabled_or_blocking_host_is_not_a_static_lease(tmp_path, dhcp, monkeypatch, options):
+    """dnsmasq skips a disabled host, and ip 'ignore' blocks the device from DHCP"""
+    change_dhcp_config(tmp_path / 'dhcp', monkeypatch,
+                       printer=('host', dict(options, mac='02:00:00:00:00:01', name='printer')),
+                       tv=('host', {'mac': '02:00:00:00:00:03', 'name': 'tv', 'enable': '1'}))
+
+    assert daemon.static_lease('02:00:00:00:00:01') is None
+    assert daemon.static_lease('02:00:00:00:00:03') == 'tv'
+
+
+def test_static_leases_are_read_again_after_failure(tmp_path, dhcp, monkeypatch, caplog):
+    config = tmp_path / 'dhcp'
+    change_dhcp_config(config, monkeypatch, printer=('host', {'mac': '02:00:00:00:00:01', 'name': 'printer'}))
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), known_static_leases=True)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError('uci is broken')
+    get = DhcpEUci.get
+    monkeypatch.setattr(DhcpEUci, 'get', broken)
+    assert tracker._static_lease('02:00:00:00:00:01') is None
+    assert 'Cannot read static DHCP leases' in caplog.text
+
+    monkeypatch.setattr(DhcpEUci, 'get', get)  # works again, the file did not change
+    assert tracker._static_lease('02:00:00:00:00:01') == 'printer'
+
+
+def test_devices_with_static_lease_are_known(tmp_path, notified, dhcp):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, known_static_leases=True)
+    feed(tracker, [Message('02:00:00:00:00:01', '192.168.1.200', family=2)] * 3 + EVENTS)
 
     assert notified == [MAC]
-    assert attempts == [MAC] * 3  # when reported, then at most once per UNSAVED_RETRY_INTERVAL
-    assert MAC in storage.macs and not tracker.unsaved
+    assert [(row[0], row[1]) for row in storage.devices()] == [('02:00:00:00:00:01', 'printer'), (MAC, None)]
+    assert dhcp.reads == 2  # only for unknown devices
+
+
+def test_static_leases_can_be_reported(tmp_path, notified, dhcp):
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), known_static_leases=False)
+    feed(tracker, [Message('02:00:00:00:00:01', '192.168.1.200', family=2)])
+
+    assert notified == ['02:00:00:00:00:01']
+    assert dhcp.reads == 0
+
+
+GUEST_IFINDEX = 9
+BOTH_NETWORKS = {IFINDEX: 'br-lan', GUEST_IFINDEX: 'br-guest-turris'}
+
+
+def feed_networks(tracker, messages):
+    for message in messages:
+        daemon.process_netlink_message(message, BOTH_NETWORKS, tracker)
+
+
+@pytest.mark.parametrize('per_network, expected', [(True, [MAC, MAC]), (False, [MAC])])
+def test_device_moving_to_another_network(tmp_path, notified, per_network, expected):
+    """E.g. a device of a guest getting into the private network"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, per_network=per_network)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)] * 2)
+    feed_networks(tracker, [Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX)] * 2)
+
+    assert notified == expected
+
+
+def test_device_known_everywhere_is_not_reported_on_any_network(tmp_path, notified):
+    """Added by `dev-detect add` or stored by an older version"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.add(MAC)
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    feed_networks(tracker, [
+        Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX),
+        Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+    ])
+
+    assert notified == []
+
+
+def test_per_network_device_is_reported_once_per_network_without_database(notified):
+    tracker = failing_tracker(FailingStorage(), per_network=True)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)] * 2)
+    feed_networks(tracker, [Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX)] * 2)
+
+    assert notified == [MAC, MAC]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_read_only_database_of_older_version(tmp_path, notified):
+    """A database of dev-detect 0.3.1 that is read-only when the daemon starts"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    conn = sqlite3.connect(db_path)
+    conn.execute('CREATE TABLE known_devices (mac text UNIQUE)')
+    conn.executemany('INSERT INTO known_devices (mac) VALUES (?)', [(MAC,), (OTHER_MAC,)])
+    conn.commit()
+    conn.close()
+    os.chmod(db_path, 0o444)
+
+    config = daemon.read_config(ConfigEUci())  # defaults
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), False, config['per_network'])
+    feed_networks(tracker, [
+        Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+        Message(OTHER_MAC, '10.111.222.51', family=2, ifindex=GUEST_IFINDEX),
+    ] * 3 + [Message('02:00:00:00:00:99', '192.168.1.99', family=2, ifindex=IFINDEX)] * 3)
+
+    assert notified == ['02:00:00:00:00:99']
+
+
+def test_both_guest_bridge_names_are_one_network(tmp_path, notified):
+    """reForis renames br-guest_turris of migrated systems to br-guest-turris"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-guest_turris')
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    feed_networks(tracker, [Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)])
+
+    assert notified == []
+
+
+def test_learned_devices_are_grouped_and_their_hostnames_stored(tmp_path, notified, learned, monkeypatch):
+    leases = tmp_path / 'dhcp.leases'
+    leases.write_text('1731440000 3e:f1:18:4d:d9:23 192.168.1.50 Mac 01:3e:f1:18:4d:d9:23\n')
+    monkeypatch.setattr(notify, 'DNSMASQ_LEASES', str(leases))
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), per_network=True)
+    tracker.start_learning()
+    ipr = FakeIPRoute(
+        links=[Link('RTM_NEWLINK', IFINDEX, 'br-lan'), Link('RTM_NEWLINK', GUEST_IFINDEX, 'br-guest-turris')],
+        neighbours=[
+            Message(MAC, '192.168.1.50', family=2, ifindex=IFINDEX),
+            Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX, state=0x04),
+            Message(OTHER_MAC, '192.168.1.51', family=2, ifindex=IFINDEX),
+        ],
+    )
+    daemon.synchronize(ipr, {}, ('br-lan', 'br-guest-turris'), tracker)
+
+    assert learned == [(MAC, ['br-lan', 'br-guest-turris'], 'Mac'), (OTHER_MAC, ['br-lan'], None)]
+    assert {(row[0], row[2], row[5]) for row in tracker.storage.devices()} == {
+        (MAC, 'br-lan', 'Mac'), (MAC, 'br-guest-turris', 'Mac'), (OTHER_MAC, 'br-lan', None),
+    }
+    assert notified == []
+
+
+LAN = Message(MAC, '192.168.1.50', family=2)
+GUEST = Message(MAC, '10.111.222.50', family=2, ifindex=GUEST_IFINDEX)
+STATIC = Message('02:00:00:00:00:01', '192.168.1.200', family=2)
+
+
+@pytest.mark.parametrize('stored, messages, writes', [
+    ([], EVENTS * 3, 1),  # stored once its notification was created, with the hostname
+    ([(MAC, 'br-lan')], EVENTS * 3, 0),  # new addresses and state changes of a known device
+    ([(MAC, 'br-lan')], [GUEST] * 3, 1),  # first time on another network
+    ([(MAC, 'br-guest_turris')], [GUEST] * 3, 0),  # renamed guest bridge
+    ([], [STATIC] * 3, 1),  # static DHCP lease, stored with its name
+    ([(MAC, 'br-lan'), (OTHER_MAC, 'br-lan')], [LAN, Message(OTHER_MAC, '192.168.1.51', family=2)], 0),  # restart
+], ids=['new', 'known', 'other network', 'renamed bridge', 'static lease', 'restart'])
+def test_database_writes(tmp_path, notified, commits, dhcp, stored, messages, writes):
+    """Every write wears out the internal flash a bit"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    for mac, iface in stored:
+        storage.store(mac, iface)
+    storage.is_empty()  # creates the database
+    tracker = daemon.DeviceTracker(storage, known_static_leases=True, per_network=True)
+    del commits[:]
+
+    feed_networks(tracker, messages)
+
+    assert len(commits) == writes
+
+
+def test_database_writes_of_known_device_over_a_day(tmp_path, notified, commits, clock):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    del commits[:]
+
+    for _ in range(24 * 60):  # every minute
+        feed(tracker, [LAN])
+        clock[0] += 60
+
+    assert len(commits) == 3  # last seen 6, 12 and 18 hours after it was stored
+
+
+def test_unsaved_devices_keep_their_names(notified, dhcp):
+    """Name of the static DHCP lease and hostname from the notification"""
+    storage = FailingStorage()
+    tracker = failing_tracker(storage, known_static_leases=True)
+    feed(tracker, [STATIC])
+    device = notify.Device(MAC, 'br-lan')
+    device.hostname = 'Mac'
+    assert tracker.is_new(MAC, 'br-lan')
+    tracker.device_reported(device)
+    storage.broken = False
+    feed(tracker, [Message(OTHER_MAC, '192.168.1.51', family=2)])
+
+    assert storage.details == {'02:00:00:00:00:01': ('printer', None), MAC: (None, 'Mac'), OTHER_MAC: (None, None)}
+    assert not tracker.unsaved
+
+
+def test_interface_of_device_known_everywhere_is_recorded_as_is(tmp_path, notified, clock):
+    """br-guest_turris on systems migrated from Turris OS 5"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.add(MAC)
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    daemon.process_netlink_message(GUEST, {GUEST_IFINDEX: 'br-guest_turris'}, tracker)
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    daemon.process_netlink_message(GUEST, {GUEST_IFINDEX: 'br-guest-turris'}, tracker)  # renamed meanwhile
+
+    assert [row[2:5] for row in storage.devices()] == [
+        ('', None, None), ('br-guest_turris', 1700000000, 1700000000 + daemon.LAST_SEEN_INTERVAL),
+    ]
+    assert notified == []
+
+
+def test_guest_bridge_renamed_while_database_does_not_work(notified):
+    tracker = failing_tracker(FailingStorage(), per_network=True)
+    daemon.process_netlink_message(GUEST, {GUEST_IFINDEX: 'br-guest_turris'}, tracker)
+    daemon.process_netlink_message(GUEST, {GUEST_IFINDEX: 'br-guest-turris'}, tracker)
+
+    assert notified == [MAC]
 
 
 @pytest.fixture
@@ -425,50 +886,158 @@ def notifications(monkeypatch):
     return waiting
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_unsaved_device_is_stored_once_database_works_again(tmp_path, notified, clock, commits):
+    """Even when no other device is stored meanwhile"""
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(OTHER_MAC, 'br-lan')
+    os.chmod(db_path, 0o444)
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True)
+    attempts = []
+    store = tracker.storage.store
+    tracker.storage.store = lambda *args, **kwargs: attempts.append(args[0]) or store(*args, **kwargs)
+    for _ in range(10):  # a device present for 10 minutes
+        feed(tracker, [LAN])
+        clock[0] += 60
+    assert notified == [MAC]
+    assert MAC in [key[0] for key in tracker.unsaved]
+    assert attempts == [MAC]  # at most once per UNSAVED_RETRY_INTERVAL
+
+    os.chmod(db_path, 0o644)
+    del commits[:]
+    for _ in range(10):
+        feed(tracker, [LAN])
+        clock[0] += 60
+
+    assert len(commits) == 1
+    assert not tracker.unsaved
+    assert not daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True).is_new(MAC, 'br-lan')
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_unsaved_devices_are_stored_with_presence_of_another(tmp_path, notified, clock):
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(OTHER_MAC, 'br-lan')
+    os.chmod(db_path, 0o444)
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True)
+    feed(tracker, [LAN])  # reported, cannot be stored, and leaves
+    os.chmod(db_path, 0o644)
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    feed(tracker, [Message(OTHER_MAC, '192.168.1.51', family=2)])  # its presence is recorded
+
+    assert not tracker.unsaved
+    assert DatabaseStorage(db_path).search(MAC)
+
+
 def test_device_reported_when_database_cannot_be_read_is_stored_after_its_notification(notifications):
     """Not by storing the devices that could not be stored meanwhile"""
-    storage = FailingStorage(search_fails=True)
-    stored = []
-    store = storage.store
-    storage.store = lambda mac: stored.append(mac) or store(mac)
+    storage = FailingStorage(read_fails=True)
     tracker = failing_tracker(storage)
-    feed(tracker, EVENTS)
+    feed(tracker, [LAN])
     storage.broken = False
-    feed(tracker, EVENTS + [Message(OTHER_MAC, '192.168.1.51', family=2)])
+    feed(tracker, [LAN, Message(OTHER_MAC, '192.168.1.51', family=2)])
     (first, on_first), (other, on_other) = notifications
 
     on_other(other)
-    assert stored == [OTHER_MAC]
+    assert storage.stored == [(OTHER_MAC, 'br-lan')]
     on_first(first)
-    assert stored == [OTHER_MAC, MAC]
+    assert storage.stored == [(OTHER_MAC, 'br-lan'), (MAC, 'br-lan')]
     assert not tracker.pending and not tracker.unsaved
+
+
+def test_presence_is_recorded_on_every_network_without_per_network(tmp_path, notified, clock):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(storage, per_network=False)
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    feed_networks(tracker, [LAN])
+    clock[0] += 3600
+    feed_networks(tracker, [GUEST])
+
+    assert [row[2:5] for row in storage.devices()] == [
+        ('br-lan', 1700000000, 1700000000 + daemon.LAST_SEEN_INTERVAL),
+        ('br-guest-turris', 1700003600 + daemon.LAST_SEEN_INTERVAL, 1700003600 + daemon.LAST_SEEN_INTERVAL),
+    ]
+    assert notified == []
+
+
+def test_learning_waits_for_a_complete_scan(tmp_path, notified, learned, monkeypatch):
+    """The startup scan can fail, e.g. while interfaces are created at boot"""
+    monkeypatch.setattr(daemon, 'RESYNC_INTERVAL', 0)
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')))
+    tracker.start_learning()
+    failures = [RuntimeError('dump interrupted')] * 3
+
+    def get_links():
+        if failures:
+            raise failures.pop()
+        return [Link('RTM_NEWLINK', IFINDEX, 'br-lan')]
+    scanner = FakeIPRoute(neighbours=[LAN, Message(OTHER_MAC, '192.168.1.51', family=2)])
+    scanner.get_links = get_links
+    assert not daemon.synchronize(scanner, {}, ('br-lan',), tracker)
+
+    with pytest.raises(EndOfTest):
+        daemon.detect_devices(FakeIPRoute([]), {}, ('br-lan',), tracker, scanner, sync_needed=True)
+
+    assert learned == [(MAC, ['br-lan'], None), (OTHER_MAC, ['br-lan'], None)]
+    assert notified == []
+
+
+def test_renamed_guest_bridge_is_stored_once(tmp_path, notified, monkeypatch):
+    """A device on the renamed bridge is reported when the database cannot be read"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-guest_turris')
+    tracker = daemon.DeviceTracker(storage, per_network=True, thread_storage=lambda: storage)
+    seen = storage.seen
+    failures = [StorageError('/srv/dev-detect/dev-detect.db: SQLITE_BUSY: database is locked')]
+
+    def failing_seen(*args):
+        if failures:
+            raise failures.pop()
+        return seen(*args)
+    monkeypatch.setattr(storage, 'seen', failing_seen)
+    daemon.process_netlink_message(GUEST, {GUEST_IFINDEX: 'br-guest-turris'}, tracker)
+
+    assert notified == [MAC]
+    assert [row[2] for row in storage.devices()] == ['br-guest_turris']
 
 
 def test_device_is_claimed_once(tmp_path, notified, monkeypatch):
     """E.g. by another thread while the database was read"""
     storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
     tracker = daemon.DeviceTracker(storage)
-    search = storage.search
+    seen = storage.seen
 
-    def search_while_claimed(mac):
-        tracker.pending.add(mac)
-        return search(mac)
-    monkeypatch.setattr(storage, 'search', search_while_claimed)
+    def seen_while_claimed(*args):
+        tracker.pending[MAC] = (MAC, 'br-lan')
+        return seen(*args)
+    monkeypatch.setattr(storage, 'seen', seen_while_claimed)
 
-    assert not tracker.is_new(MAC)
+    assert not tracker.is_new(MAC, 'br-lan')
 
 
 def test_reported_device_that_cannot_be_stored_for_unexpected_reason(notified, caplog):
     """It must not become unknown, it would be reported again and again"""
     class BrokenStorage(FailingStorage):
-        def store(self, mac):
+        def store(self, *args, **kwargs):
             raise RuntimeError('unexpected')
-    tracker = failing_tracker(BrokenStorage())
+    tracker = failing_tracker(BrokenStorage(), per_network=True)
     feed(tracker, EVENTS * 2)
 
     assert notified == [MAC]
-    assert not tracker.pending and tracker.unsaved == {MAC}
+    assert not tracker.pending and list(tracker.unsaved) == [(MAC, 'br-lan')]
     assert 'Cannot record device' in caplog.text
+
+
+def test_device_removed_while_pending_is_stored_after_its_notification(tmp_path, notifications):
+    db_path = str(tmp_path / 'dev-detect.db')
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path))
+    feed(tracker, [LAN])
+    assert not DatabaseStorage(db_path).remove(MAC)  # not stored yet
+    (device, on_reported), = notifications
+    on_reported(device)
+
+    assert DatabaseStorage(db_path).search(MAC)
 
 
 @pytest.fixture(autouse=True)
@@ -477,13 +1046,11 @@ def messages_waiting(monkeypatch):
     monkeypatch.setattr(daemon, 'wait_for_messages', lambda ipr, timeout: True)
 
 
-def test_unsaved_device_is_stored_also_when_no_message_comes(notified, monkeypatch):
+def test_unsaved_device_is_stored_also_when_no_message_comes(notified, clock, monkeypatch):
     """E.g. the device left before the database works again"""
-    clock = [1000.0]
-    monkeypatch.setattr(daemon.time, 'monotonic', lambda: clock[0])
     storage = FailingStorage()
-    tracker = failing_tracker(storage)
-    feed(tracker, EVENTS[:1])  # reported, cannot be stored
+    tracker = failing_tracker(storage, per_network=True)
+    feed(tracker, [LAN])  # reported, cannot be stored
     storage.broken = False
     timeouts = [False, False]
 
@@ -496,4 +1063,5 @@ def test_unsaved_device_is_stored_also_when_no_message_comes(notified, monkeypat
     with pytest.raises(EndOfTest):
         daemon.detect_devices(FakeIPRoute(), {}, ('br-lan',), tracker, FakeIPRoute())
 
-    assert MAC in storage.macs and not tracker.unsaved
+    assert storage.stored == [(MAC, 'br-lan')]
+    assert not tracker.unsaved

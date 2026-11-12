@@ -18,11 +18,14 @@ Package include simple cli interface called `dev-detect` to interact with device
 
 You can use one of following commands:
 ```
-search <MAC>        Search device by MAC address
-remove <MAC>        Delete specified MAC address
-list                List known devices
-clear               Clear/reset database
+search <MAC>               Search device by MAC address
+add <MAC> [--name NAME]    Mark device as known, so that it is not reported
+remove <MAC>               Delete specified MAC address
+list                       List known devices
+clear                      Clear/reset database
 ```
+
+Devices become known when they are reported. `list` shows where and when they were first and last seen and their hostname. A device can be marked as known on every network in advance with `add`, `add --name` also names (or renames) a device, and `remove` makes it reported again next time it appears.
 
 For full options see help:
 ```
@@ -46,13 +49,40 @@ The vendor is looked up by `ouidb`. Devices using a private (randomized) MAC add
 
 A device is stored as known once its notification is created, or once creating it failed (the error is logged, and the device is not reported again). If the daemon stops before (restart, crash, reboot), the device is reported again after it starts. When the database cannot be written, reported devices are kept in memory and stored once it works again, so they are not reported repeatedly; only a restart of the daemon meanwhile makes them reported again.
 
+## Networks
+
+A device is reported when it appears on a watched network for the first time, so that e.g. a device getting from the guest network into the private one is reported too. Devices added by `dev-detect add` (or stored by older versions) are known on every network. To report each device only once, wherever it appears, set:
+
+```
+config detection 'detection'
+    option per_network '0'
+```
+
+## Static DHCP leases
+
+Devices with a static DHCP lease (`config host` in `/etc/config/dhcp`, not disabled and not ignoring the device) are known to the administrator, so they are stored without being reported, named after the lease. To report them as well, set:
+
+```
+config detection 'detection'
+    option known_static_leases '0'
+```
+
+## Empty database
+
+When the device database is empty when the daemon starts (on the first start, or when the service starts after `dev-detect clear` or after the database was lost), devices that are present are stored without reporting each of them, and a single notification lists them. To report each of them instead, set:
+
+```
+config detection 'detection'
+    option learn_on_empty '0'
+```
+
 ## Persistence
 
 Detected devices are stored in sqlite database in order to remember already discovered devices.
 
-By default it is stored on internal storage, which is suitable when you expect small number of devices that appears regularly (e.g. home network, small office). 
+By default it is stored in `/srv/dev-detect/dev-detect.db`. `/srv` is on the internal storage, unless the storage plugin moved it to an external disk. The daemon creates the directory when it starts. The internal storage is suitable when you expect small number of devices that appears regularly (e.g. home network, small office).
 
-If you want to enable device detection in network where you could expect lots of different clients connecting through your router, e.g. public Wi-Fi AP, it is recommended to store database either on external persistent storage (flash drive, external HDD) or ramdisk as precaution to wearing out internal storage.
+If you want to enable device detection in network where you could expect lots of different clients connecting through your router, e.g. public Wi-Fi AP, it is recommended to store database either on external persistent storage (flash drive, external HDD) or ramdisk as precaution to wearing out internal storage. The database is written when a device is stored, and when a known device is seen again at most once per 6 hours for each device and network. A database on ramdisk is lost on reboot, so devices are reported again after each reboot as they reconnect (only the few already present when the daemon starts are learned, see Empty database).
 
 Just change `db_path` location in `storage` section.
 
@@ -60,6 +90,8 @@ Just change `db_path` location in `storage` section.
 config storage 'storage'
     option db_path   '/path/to/persistent/storage/dev-detect.db'
 ```
+
+The disk with the database has to be mounted before dev-detect starts, otherwise the directory is created on the internal storage. The storage plugin mounts `/srv` in time.
 
 ## Watch list
 

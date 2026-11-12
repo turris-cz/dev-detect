@@ -1,6 +1,7 @@
 import argparse
 import re
 import sys
+import time
 
 from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
@@ -25,6 +26,10 @@ def setup_argparser():
     parser_search = subparsers.add_parser('search', help='Search device by MAC address')
     parser_search.add_argument('mac', type=mac_address, help='MAC address of device')
 
+    parser_add = subparsers.add_parser('add', help='Mark device as known, so that it is not reported')
+    parser_add.add_argument('mac', type=mac_address, help='MAC address of device')
+    parser_add.add_argument('--name', help='name of device shown in list')
+
     parser_delete = subparsers.add_parser('remove', help='Delete specified MAC address')
     parser_delete.add_argument('mac', type=mac_address, help='MAC address of device')
 
@@ -35,9 +40,27 @@ def setup_argparser():
 
 
 def list_devices(storage, args):
-    print('Known devices:')
-    for m in storage.get_known():
-        print(m)
+    def timestamp(value):
+        return time.strftime('%Y-%m-%d %H:%M', time.localtime(value)) if value else '-'
+
+    rows = [('MAC ADDRESS', 'NAME', 'INTERFACE', 'FIRST SEEN', 'LAST SEEN', 'HOSTNAME')]
+    for mac, name, iface, first_seen, last_seen, hostname in storage.devices():
+        rows.append((
+            mac,
+            name or '-',
+            iface or '*',  # known on every interface
+            timestamp(first_seen),
+            timestamp(last_seen),
+            hostname or '-',
+        ))
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    for row in rows:
+        print('  '.join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def add(storage, args):
+    if not storage.add(args.mac, args.name) and args.name is None:
+        print('Device {} is already known'.format(args.mac))
 
 
 def search(storage, args):
@@ -60,6 +83,7 @@ def clear(storage, args):
 
 action_map = {
     'list': list_devices,
+    'add': add,
     'search': search,
     'remove': remove,
     'clear': clear

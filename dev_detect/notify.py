@@ -29,16 +29,25 @@ FIRST_LOOKUP_DELAY = 5
 LOOKUP_INTERVAL = 5
 MAX_LOOKUP_TIME = 30
 
+# number of devices listed in the notification about learned devices
+LEARNED_LIMIT = 20
+
 TEXTS = {
     'cs': {
         'title': 'Nové zařízení v síti {network}: {name}',
         'mac': 'MAC adresa: {mac}',
         'randomized': 'náhodná adresa, výrobce neznámý',
+        'learned': 'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
+                   ' bez samostatných oznámení ({count}):',
+        'more': 'další: {count} (dev-detect list)',
     },
     'en': {
         'title': 'New device on network {network}: {name}',
         'mac': 'MAC address: {mac}',
         'randomized': 'randomized address, vendor unknown',
+        'learned': 'The device database was empty at start, so devices already present were stored'
+                   ' without separate notifications ({count}):',
+        'more': 'more: {count} (dev-detect list)',
     },
 }
 
@@ -251,7 +260,7 @@ def compose(device, lang):
     return '\n'.join(lines)
 
 
-def send(device):
+def create_notification(message_cs, message_en, subject):
     """Create notification (reForis, e-mail, ntfy) using create_notification of user-notify
 
     create_notification also accepts a single message whose parts marked with
@@ -259,18 +268,60 @@ def send(device):
     the catalog, both the Czech and the English message are passed. Return
     whether the notification was created.
     """
-    command = ['create_notification', '-s', 'news', compose(device, 'cs'), compose(device, 'en')]
+    command = ['create_notification', '-s', 'news', message_cs, message_en]
     try:
         result = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        logger.error('Cannot create notification about device %s: %s', device.mac, e)
+        logger.error('Cannot create notification about %s: %s', subject, e)
         return False
     if result.returncode != 0:
-        logger.error('Cannot create notification about device %s: %s', device.mac, result.stderr.strip())
+        logger.error('Cannot create notification about %s: %s', subject, result.stderr.strip())
         return False
     return True
+
+
+def send(device):
+    """Create notification about the device, return whether it was created"""
+    return create_notification(compose(device, 'cs'), compose(device, 'en'), 'device ' + device.mac)
+
+
+def compose_learned(devices, lang, networks=None):
+    """devices are (mac, interfaces, hostname), networks maps interfaces to network names"""
+    networks = networks or {}
+    texts = TEXTS[lang]
+    lines = [texts['learned'].format(count=len(devices))]
+    for mac, ifaces, hostname in devices[:LEARNED_LIMIT]:
+        details = [hostname] + [networks.get(iface, iface) for iface in ifaces]
+        lines.append('{} ({})'.format(mac, ', '.join(filter(None, details))))
+    if len(devices) > LEARNED_LIMIT:
+        lines.append(texts['more'].format(count=len(devices) - LEARNED_LIMIT))
+    return '\n'.join(lines)
+
+
+def report_learned(devices):
+    try:
+        networks = {}
+        for iface in {iface for _, ifaces, _ in devices for iface in ifaces}:
+            try:
+                networks[iface] = network_name(iface)
+            except Exception:
+                logger.debug('Cannot find network of interface %s', iface, exc_info=True)
+        create_notification(
+            compose_learned(devices, 'cs', networks), compose_learned(devices, 'en', networks),
+            '{} learned devices'.format(len(devices)),
+        )
+    except Exception:
+        logger.exception('Cannot report learned devices')
+
+
+def learned_devices(devices):
+    """Report in background devices that were stored without reporting each of them
+
+    devices are (mac, interfaces, hostname)
+    """
+    threading.Thread(target=report_learned, args=(list(devices),), daemon=True).start()
 
 
 class _Waiting:

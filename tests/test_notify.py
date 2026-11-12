@@ -563,3 +563,26 @@ def test_notifier_thread(lookups, monkeypatch):
 
     assert done.wait(10)
     assert reported == [MAC, APPLE_MAC]
+
+
+def test_compose_learned(monkeypatch):
+    monkeypatch.setattr(notify, 'LEARNED_LIMIT', 2)
+    devices = [
+        (MAC, ['br-lan', 'br-guest-turris'], 'Mac'),
+        ('02:00:00:00:00:02', ['br-lan'], None),
+        ('02:00:00:00:00:09', ['br-guest-turris'], 'phone'),
+    ]
+    networks = {'br-lan': 'lan', 'br-guest-turris': 'guest_turris'}
+
+    assert notify.compose_learned(devices, 'en', networks) == (
+        'The device database was empty at start, so devices already present were stored'
+        ' without separate notifications (3):\n'
+        '3e:f1:18:4d:d9:23 (Mac, lan, guest_turris)\n'
+        '02:00:00:00:00:02 (lan)\n'
+        'more: 1 (dev-detect list)'
+    )
+    assert notify.compose_learned(devices[1:2], 'cs') == (
+        'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
+        ' bez samostatných oznámení (1):\n'
+        '02:00:00:00:00:02 (br-lan)'
+    )

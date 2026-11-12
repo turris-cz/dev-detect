@@ -1,5 +1,6 @@
 import argparse
 import os
+import sqlite3
 import sys
 import types
 
@@ -38,7 +39,7 @@ def test_invalid_mac_address(value):
 @pytest.fixture
 def storage(tmp_path):
     storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
-    storage.store(MAC)  # the daemon stores lower-case colon separated addresses
+    storage.add(MAC)  # the daemon stores lower-case colon separated addresses
     yield storage
     storage.close()
 
@@ -105,4 +106,51 @@ def test_database_is_not_touched_for_help_or_invalid_arguments(uci, argv, code):
 
 def test_main(uci, capsys):
     cli.main(['list'])
-    assert capsys.readouterr().out == 'Known devices:\n'
+    assert capsys.readouterr().out.split() == ['MAC', 'ADDRESS', 'NAME', 'INTERFACE', 'FIRST', 'SEEN', 'LAST', 'SEEN', 'HOSTNAME']
+
+
+def test_list(storage, capsys):
+    storage.store('02:00:00:00:00:01', 'br-lan', hostname='printer')
+    run(storage, 'list')
+    lines = capsys.readouterr().out.splitlines()
+
+    assert lines[1].split()[:3] == [MAC, '-', '*']  # known on every interface
+    assert lines[2].split()[:3] == ['02:00:00:00:00:01', '-', 'br-lan']
+    assert lines[2].split()[-1] == 'printer'
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_list_read_only_database_of_older_version(uci, capsys):
+    conn = sqlite3.connect(uci.db_path)
+    conn.execute('CREATE TABLE known_devices (mac text UNIQUE)')
+    conn.execute("INSERT INTO known_devices (mac) VALUES ('aa:bb:cc:dd:ee:ff')")
+    conn.commit()
+    conn.close()
+    os.chmod(uci.db_path, 0o444)
+
+    cli.main(['list'])
+    assert capsys.readouterr().out.splitlines()[1].split() == [MAC, '-', '*', '-', '-', '-']
+
+
+def test_add(storage, capsys):
+    run(storage, 'add', '02-00-00-00-00-AA', '--name', 'printer')
+    run(storage, 'add', MAC)
+    run(storage, 'list')
+    out = capsys.readouterr().out
+
+    assert storage.search('02:00:00:00:00:aa')
+    assert 'Device aa:bb:cc:dd:ee:ff is already known' in out
+    assert ['02:00:00:00:00:aa', 'printer', '*'] in [line.split()[:3] for line in out.splitlines()]
+
+
+def test_add_name_to_known_device(storage, capsys):
+    storage.store('02:00:00:00:00:01', 'br-lan')
+    run(storage, 'add', '02:00:00:00:00:01', '--name', 'printer')
+    run(storage, 'add', MAC, '--name', 'laptop')
+    run(storage, 'list')
+    out = capsys.readouterr().out
+
+    assert 'already known' not in out
+    assert [line.split()[:3] for line in out.splitlines()[1:]] == [
+        [MAC, 'laptop', '*'], ['02:00:00:00:00:01', 'printer', '*'], ['02:00:00:00:00:01', 'printer', 'br-lan'],
+    ]
