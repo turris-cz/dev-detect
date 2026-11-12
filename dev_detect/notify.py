@@ -8,11 +8,16 @@ device was detected, at the latest after MAX_LOOKUP_TIME:
     MAC address: 3e:f1:18:4d:d9:23 (randomized address, vendor unknown)
     IPv4: 192.168.1.50
     IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac
+
+create_notification of user-notify translates the parts of the message marked
+by _() to the language of the router, with the user-notify catalog of
+turris-translations (packages user-notify-l10n-<language>).
 """
 import ipaddress
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -32,30 +37,24 @@ MAX_LOOKUP_TIME = 30
 # number of devices listed in the notification about learned devices
 LEARNED_LIMIT = 20
 
-TEXTS = {
-    'cs': {
-        'title': 'Nové zařízení v síti {network}: {name}',
-        'back': 'Zařízení se vrátilo do sítě {network} po {days}: {name}',
-        'day': '{count} dni',
-        'days': '{count} dnech',
-        'mac': 'MAC adresa: {mac}',
-        'randomized': 'náhodná adresa, výrobce neznámý',
-        'learned': 'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
-                   ' bez samostatných oznámení ({count}):',
-        'more': 'další: {count} (dev-detect list)',
-    },
-    'en': {
-        'title': 'New device on network {network}: {name}',
-        'back': 'Device back on network {network} after {days}: {name}',
-        'day': '{count} day',
-        'days': '{count} days',
-        'mac': 'MAC address: {mac}',
-        'randomized': 'randomized address, vendor unknown',
-        'learned': 'The device database was empty at start, so devices already present were stored'
-                   ' without separate notifications ({count}):',
-        'more': 'more: {count} (dev-detect list)',
-    },
-}
+DAY = 24 * 3600
+
+
+def translated(text):
+    """Mark text to be translated by create_notification (gettext_filter of user-notify)
+
+    The text must not contain ')'.
+    """
+    return '_({})'.format(text)
+
+
+def plain(value):
+    """Text from the network, which must not be taken for a part to translate
+
+    Underscores go through gettext_filter in _() too, as they are: it would
+    take '_(' for the start of a part to translate and double runs of them.
+    """
+    return re.sub(r'_+', lambda match: translated(match.group()), str(value))
 
 
 class Device:
@@ -255,34 +254,31 @@ def vendor(mac):
     return lines[0].strip().rstrip(',') or None if lines else None
 
 
-def compose(device, lang):
-    texts = TEXTS[lang]
-    detail = texts['randomized'] if is_randomized(device.mac) else device.vendor
+def compose(device):
+    name = plain(device.hostname or device.mac)
     if device.away is None:
-        title = texts['title']
-        days = None
+        lines = ['{} {}: {}'.format(translated('New device on network'), plain(device.network), name)]
     else:
-        count = int(device.away // (24 * 3600))
-        title = texts['back']
-        days = texts['day' if count == 1 else 'days'].format(count=count)
-    lines = [
-        title.format(network=device.network, name=device.hostname or device.mac, days=days),
-        texts['mac'].format(mac=device.mac) + (' ({})'.format(detail) if detail else ''),
-    ]
+        lines = [
+            '{} {}: {}'.format(translated('Device back on network'), plain(device.network), name),
+            '{}: {}'.format(translated('Days away'), int(device.away // DAY)),
+        ]
+    if is_randomized(device.mac):
+        detail = translated('randomized address, vendor unknown')
+    else:
+        detail = device.vendor and plain(device.vendor)
+    lines.append('{}: {}'.format(translated('MAC address'), device.mac) + (' ({})'.format(detail) if detail else ''))
     for address in sort_addresses(device.addresses):
         lines.append('IPv{}: {}'.format(ipaddress.ip_address(address).version, address))
     return '\n'.join(lines)
 
 
-def create_notification(message_cs, message_en, subject):
+def create_notification(message, subject):
     """Create notification (reForis, e-mail, ntfy) using create_notification of user-notify
 
-    create_notification also accepts a single message whose parts marked with
-    _() are translated from the user-notify catalog; until these texts are in
-    the catalog, both the Czech and the English message are passed. Return
-    whether the notification was created.
+    Return whether the notification was created.
     """
-    command = ['create_notification', '-s', 'news', message_cs, message_en]
+    command = ['create_notification', '-s', 'news', message]
     try:
         result = subprocess.run(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30,
@@ -298,19 +294,21 @@ def create_notification(message_cs, message_en, subject):
 
 def send(device):
     """Create notification about the device, return whether it was created"""
-    return create_notification(compose(device, 'cs'), compose(device, 'en'), 'device ' + device.mac)
+    return create_notification(compose(device), 'device ' + device.mac)
 
 
-def compose_learned(devices, lang, networks=None):
+def compose_learned(devices, networks=None):
     """devices are (mac, interfaces, hostname), networks maps interfaces to network names"""
     networks = networks or {}
-    texts = TEXTS[lang]
-    lines = [texts['learned'].format(count=len(devices))]
+    lines = [translated(
+        'The device database was empty at start, so devices already present were stored'
+        ' without separate notifications:'
+    )]
     for mac, ifaces, hostname in devices[:LEARNED_LIMIT]:
         details = [hostname] + [networks.get(iface, iface) for iface in ifaces]
-        lines.append('{} ({})'.format(mac, ', '.join(filter(None, details))))
+        lines.append('{} ({})'.format(mac, plain(', '.join(filter(None, details)))))
     if len(devices) > LEARNED_LIMIT:
-        lines.append(texts['more'].format(count=len(devices) - LEARNED_LIMIT))
+        lines.append('{}: {} (dev-detect list)'.format(translated('More devices'), len(devices) - LEARNED_LIMIT))
     return '\n'.join(lines)
 
 
@@ -322,10 +320,7 @@ def report_learned(devices):
                 networks[iface] = network_name(iface)
             except Exception:
                 logger.debug('Cannot find network of interface %s', iface, exc_info=True)
-        create_notification(
-            compose_learned(devices, 'cs', networks), compose_learned(devices, 'en', networks),
-            '{} learned devices'.format(len(devices)),
-        )
+        create_notification(compose_learned(devices, networks), '{} learned devices'.format(len(devices)))
     except Exception:
         logger.exception('Cannot report learned devices')
 

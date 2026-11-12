@@ -45,6 +45,8 @@ IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac
 
 The notification is created once the hostname is known, usually 5 to 10 seconds after the device appears. A device without a hostname is reported after about half a minute.
 
+The notification is in the language of the router set in reForis. The translations come from [turris-translations](https://hosted.weblate.org/projects/turris/user-notify/), installed as `user-notify-l10n-<language>`; a text without a translation stays in English.
+
 The vendor is looked up by `ouidb`. Devices using a private (randomized) MAC address have no vendor and may be reported again when their address changes.
 
 A device is stored as known once its notification is created, or once creating it failed (the error is logged, and the device is not reported again). If the daemon stops before (restart, crash, reboot), the device is reported again after it starts. When the database cannot be written, reported devices are kept in memory and stored once it works again, so they are not reported repeatedly; only a restart of the daemon meanwhile makes them reported again.
@@ -88,7 +90,8 @@ config detection 'detection'
 The notification then says how long the device was away:
 
 ```
-Device back on network lan after 120 days: Mac
+Device back on network lan: Mac
+Days away: 120
 ```
 
 The time counts from when the device was last seen on the network (on any network with `per_network '0'`). That is recorded at most once per 6 hours, so a device is reported after it was away for the set number of days and up to 6 hours more. Devices added by `dev-detect add` (or stored by older versions) are not forgotten, nor are devices with a static DHCP lease unless `known_static_leases` is `0`. After a restart of the daemon, a device can be reported as back also when the database could not be written for long. A router without RTC has a wrong clock until NTP sets it after a restart; a device seen meanwhile can be reported with fewer days, not at all, or also when it was not away for that long.

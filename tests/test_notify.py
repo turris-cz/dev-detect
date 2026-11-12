@@ -1,4 +1,5 @@
 import ipaddress
+import re
 import subprocess
 import sys
 import threading
@@ -173,14 +174,61 @@ def device(mac=MAC, hostname='Mac', vendor=None, addresses=('192.168.1.50', IPV6
     return result
 
 
+def gettext_filter(text, translations):
+    """gettext_filter of user-notify, which translates the parts marked by _(), rewritten from C"""
+    out, msgid = [], []
+    translating, last = False, ''
+    for c in text:
+        if translating:
+            if c == ')' and last != '\\':
+                if msgid:
+                    out.append(translations.get(''.join(msgid), ''.join(msgid)))
+                translating, last, msgid = False, '', []
+            else:
+                if c != '\\':
+                    msgid.append(c)
+                last = c
+        elif last == '_':
+            if c == '(':
+                translating = True
+            else:
+                out.append('_' + c)
+                last = c
+        elif c == '_':
+            last = '_'
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
+# translations in the catalog of user-notify
+CZECH = {
+    'New device on network': 'Nové zařízení v síti',
+    'Device back on network': 'Zařízení se vrátilo do sítě',
+    'Days away': 'Dní nepřítomnosti',
+    'MAC address': 'MAC adresa',
+    'randomized address, vendor unknown': 'náhodná adresa, výrobce neznámý',
+    'The device database was empty at start, so devices already present were stored without separate'
+    ' notifications:': 'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
+                       ' bez samostatných oznámení:',
+    'More devices': 'Další zařízení',
+}
+
+
 def test_compose():
-    assert notify.compose(device(), 'en') == (
+    assert notify.compose(device()) == (
+        '_(New device on network) lan: Mac\n'
+        '_(MAC address): 3e:f1:18:4d:d9:23 (_(randomized address, vendor unknown))\n'
+        'IPv4: 192.168.1.50\n'
+        'IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac'
+    )
+    assert gettext_filter(notify.compose(device()), {}) == (
         'New device on network lan: Mac\n'
         'MAC address: 3e:f1:18:4d:d9:23 (randomized address, vendor unknown)\n'
         'IPv4: 192.168.1.50\n'
         'IPv6: 2a00:1028:8388:a84e:a1a4:8dbf:7ab8:e5ac'
     )
-    assert notify.compose(device(), 'cs') == (
+    assert gettext_filter(notify.compose(device()), CZECH) == (
         'Nové zařízení v síti lan: Mac\n'
         'MAC adresa: 3e:f1:18:4d:d9:23 (náhodná adresa, výrobce neznámý)\n'
         'IPv4: 192.168.1.50\n'
@@ -189,32 +237,55 @@ def test_compose():
 
 
 def test_compose_with_vendor_and_without_hostname():
-    message = notify.compose(device(APPLE_MAC, hostname=None, vendor='Apple', addresses=['fe80::1']), 'en')
+    message = notify.compose(device(APPLE_MAC, hostname=None, vendor='Apple', addresses=['fe80::1']))
 
-    assert message == (
+    assert gettext_filter(message, {}) == (
         'New device on network lan: f0:18:98:aa:bb:cc\n'
         'MAC address: f0:18:98:aa:bb:cc (Apple)\n'
         'IPv6: fe80::1'  # link-local address only when nothing else is known
     )
 
 
-@pytest.mark.parametrize('days, cs, en', [
-    (120, 'Zařízení se vrátilo do sítě lan po 120 dnech: Mac', 'Device back on network lan after 120 days: Mac'),
-    (1, 'Zařízení se vrátilo do sítě lan po 1 dni: Mac', 'Device back on network lan after 1 day: Mac'),
-])
-def test_compose_device_that_came_back(days, cs, en):
+def test_compose_device_that_came_back():
     dev = device()
-    dev.away = days * 24 * 3600 + 3600
+    dev.away = 120 * 24 * 3600 + 3600
 
-    assert notify.compose(dev, 'cs').splitlines()[0] == cs
-    assert notify.compose(dev, 'en').splitlines()[0] == en
-    assert notify.compose(dev, 'en').splitlines()[1:] == notify.compose(device(), 'en').splitlines()[1:]
+    assert gettext_filter(notify.compose(dev), CZECH).splitlines()[:3] == [
+        'Zařízení se vrátilo do sítě lan: Mac',
+        'Dní nepřítomnosti: 120',
+        'MAC adresa: 3e:f1:18:4d:d9:23 (náhodná adresa, výrobce neznámý)',
+    ]
+    assert gettext_filter(notify.compose(dev), {}).splitlines()[:2] == ['Device back on network lan: Mac', 'Days away: 120']
 
 
-@pytest.mark.parametrize('lang', ['cs', 'en'])
+@pytest.mark.parametrize('hostname', [
+    'evil_(Days away)', 'a_(b', '__(MAC address)', 'host_', '_x', 'my__phone', 'a___b', 'a_)b', 'back\\slash(x)',
+])
+def test_values_from_network_are_not_translated(hostname):
+    """A device chooses its hostname, and they reach the notification as they are"""
+    dev = device(APPLE_MAC, hostname=hostname, vendor='Vendor__(MAC address)', addresses=['192.168.1.50'])
+    dev.network = 'guest__turris'
+    title, mac = gettext_filter(notify.compose(dev), CZECH).splitlines()[:2]
+
+    assert title == 'Nové zařízení v síti guest__turris: ' + hostname
+    assert mac == 'MAC adresa: f0:18:98:aa:bb:cc (Vendor__(MAC address))'
+
+
+def all_marked_texts():
+    came_back = device()
+    came_back.away = 40 * 24 * 3600
+    messages = [notify.compose(device()), notify.compose(came_back),
+                notify.compose_learned([(MAC, ['br-lan'], None)] * (notify.LEARNED_LIMIT + 1))]
+    return {text for message in messages for text in re.findall(r'_\(([^)]*)\)', message)}
+
+
+def test_every_marked_text_has_translation():
+    assert all_marked_texts() == set(CZECH)
+
+
 @pytest.mark.parametrize('dev', [device(), device(APPLE_MAC, None, None, ['192.168.1.60'])])
-def test_composed_message_has_no_double_spaces(lang, dev):
-    assert '  ' not in notify.compose(dev, lang)
+def test_composed_message_has_no_double_spaces(dev):
+    assert '  ' not in gettext_filter(notify.compose(dev), CZECH)
 
 
 class FakeEUci:
@@ -262,8 +333,7 @@ def test_send(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', run)
     notify.send(device())
 
-    assert commands == [['create_notification', '-s', 'news', notify.compose(device(), 'cs'),
-                         notify.compose(device(), 'en')]]
+    assert commands == [['create_notification', '-s', 'news', notify.compose(device())]]
 
 
 @pytest.mark.parametrize('returncode, created', [(0, True), (1, False)])
@@ -596,15 +666,15 @@ def test_compose_learned(monkeypatch):
     ]
     networks = {'br-lan': 'lan', 'br-guest-turris': 'guest_turris'}
 
-    assert notify.compose_learned(devices, 'en', networks) == (
+    assert gettext_filter(notify.compose_learned(devices, networks), {}) == (
         'The device database was empty at start, so devices already present were stored'
-        ' without separate notifications (3):\n'
+        ' without separate notifications:\n'
         '3e:f1:18:4d:d9:23 (Mac, lan, guest_turris)\n'
         '02:00:00:00:00:02 (lan)\n'
-        'more: 1 (dev-detect list)'
+        'More devices: 1 (dev-detect list)'
     )
-    assert notify.compose_learned(devices[1:2], 'cs') == (
+    assert gettext_filter(notify.compose_learned(devices[1:2]), CZECH) == (
         'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
-        ' bez samostatných oznámení (1):\n'
+        ' bez samostatných oznámení:\n'
         '02:00:00:00:00:02 (br-lan)'
     )
