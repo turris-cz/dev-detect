@@ -1,16 +1,17 @@
 import argparse
 import logging
+import os
 import subprocess
 import time
 import threading
 
-from euci import EUci
-from pyroute2 import IPRoute
-
 from .constants import IPV4, IPV6, REACHABLE
-from .storage import DatabaseStorage
+from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
 logger = logging.getLogger(__name__)
+
+# how often to try storing devices that could not be stored, in seconds
+UNSAVED_RETRY_INTERVAL = 15 * 60
 
 ADDRMAP = {
     IPV4: '4',
@@ -56,7 +57,57 @@ def get_interfaces(ipr, watched_interfaces):
     return interfaces
 
 
-def process_netlink_message(message, interfaces, storage):
+class DeviceTracker:
+    """Decide whether a device is new and remember it
+
+    The database stays the source of truth, so a device removed from it by
+    `dev-detect remove` is reported again. A device that cannot be stored is
+    kept in memory instead, so that it is reported only once even when the
+    database is not writable, and stored once the database works again.
+    """
+    def __init__(self, storage):
+        self.storage = storage
+        self.unsaved = set()
+        self.unsaved_retried = None  # when storing unsaved devices was last tried (monotonic)
+
+    def is_new(self, mac):
+        if mac in self.unsaved:
+            self._retry_unsaved()
+            return False
+
+        try:
+            if self.storage.search(mac):
+                return False
+            self.storage.store(mac)
+        except StorageError as e:
+            logger.error('Cannot record device %s, it will not be reported again until restart: %s', mac, e)
+            self.unsaved.add(mac)
+        else:
+            self._store_unsaved()
+        return True
+
+    def _retry_unsaved(self):
+        """A device that could not be stored is still present, store it if the database works again
+
+        Tried at most once per UNSAVED_RETRY_INTERVAL, not for every message.
+        """
+        now = time.monotonic()
+        if self.unsaved_retried is not None and now - self.unsaved_retried < UNSAVED_RETRY_INTERVAL:
+            return
+        self.unsaved_retried = now
+        self._store_unsaved()
+
+    def _store_unsaved(self):
+        """Database works again, store devices that could not be stored before"""
+        for mac in list(self.unsaved):
+            try:
+                self.storage.store(mac)
+            except StorageError:
+                return
+            self.unsaved.discard(mac)
+
+
+def process_netlink_message(message, interfaces, tracker):
     mac = message.get_attr('NDA_LLADDR')
     ip = message.get_attr('NDA_DST')
 
@@ -64,24 +115,22 @@ def process_netlink_message(message, interfaces, storage):
     if not mac or not ip:
         return
 
-    if mac not in storage.get_known():
-        storage.store(mac)
-
+    if tracker.is_new(mac):
         # interfaces are there just to conform to notify shell script interface
         # TODO: use interface name elsewhere? omit it in notifications completely?
         new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
 
 
-def get_neigbours_from_arp(ipr, interfaces, storage):
+def get_neigbours_from_arp(ipr, interfaces, tracker):
     """Explicit query ARP table for reachable devices on selected interfaces"""
     for nic in interfaces:
         devices = ipr.get_neighbours(ifindex=nic)
 
         for dev in filter(lambda dev: dev['state'] == REACHABLE, devices):
-            process_netlink_message(dev, interfaces, storage)
+            process_netlink_message(dev, interfaces, tracker)
 
 
-def detect_devices(ipr, interfaces, storage):
+def detect_devices(ipr, interfaces, tracker):
     """Detect new devices from netlink broadcast"""
     while True:
         for message in ipr.get():
@@ -90,7 +139,16 @@ def detect_devices(ipr, interfaces, storage):
 
             # we are interested only in new devices on selected interfaces
             if message['event'] == 'RTM_NEWNEIGH' and message['ifindex'] in interfaces:
-                process_netlink_message(message, interfaces, storage)
+                process_netlink_message(message, interfaces, tracker)
+
+
+def open_storage(db_path):
+    """Open database, creating its directory (e.g. on a newly mounted /srv)"""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    except OSError as e:
+        logger.error('Cannot create directory for %s: %s', db_path, e)
+    return DatabaseStorage(db_path)
 
 
 def setup_logging(loglevel):
@@ -100,6 +158,10 @@ def setup_logging(loglevel):
 
 
 def main():
+    # imported here so that the detection logic can be tested without them
+    from euci import EUci
+    from pyroute2 import IPRoute
+
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--debug', help="Show debug messages", action="store_true")
 
@@ -111,7 +173,7 @@ def main():
         db_path = uci.get(
             'dev-detect', 'storage', 'db_path',
             dtype=str,
-            default='/srv/dev-detect/dev-detect.db'
+            default=DEFAULT_DB_PATH
         )
         watched_interfaces = uci.get(
             'dev-detect', 'watchlist', 'ifaces',
@@ -120,14 +182,14 @@ def main():
             list=True
         )
 
-    storage = DatabaseStorage(db_path)
+    tracker = DeviceTracker(open_storage(db_path))
 
     with IPRoute() as ipr:
         ipr.bind()  # subscribe to netlink broadcast
 
         interfaces = get_interfaces(ipr, watched_interfaces)
-        get_neigbours_from_arp(ipr, interfaces, storage)
-        detect_devices(ipr, interfaces, storage)
+        get_neigbours_from_arp(ipr, interfaces, tracker)
+        detect_devices(ipr, interfaces, tracker)
 
 
 if __name__ == "__main__":

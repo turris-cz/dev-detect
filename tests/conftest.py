@@ -16,6 +16,7 @@ def storage(request, tmpdir):
             storage.store(item)
 
     yield storage
+    storage.close()
 
 
 def pytest_make_parametrize_id(config, val):
