@@ -45,7 +45,9 @@ config storage 'storage'
 
 ## Watch list
 
-By default `dev-detect` only detect devices on internal lan bridges (`br-lan`, `br-guest_turris`), however it can be configured to check multiple interfaces.
+By default `dev-detect` only detect devices on internal lan bridges (`br-lan` and the guest network bridge `br-guest-turris`, or `br-guest_turris` on systems migrated from Turris OS 5), however it can be configured to check multiple interfaces.
+
+Interfaces that do not exist yet are watched as soon as they appear, and an interface that is re-created (e.g. on network restart) keeps being watched.
 
 To add another network interface to watch list, append `list ifaces <interface>` line to `watchlist` section.
 

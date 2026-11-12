@@ -1,14 +1,22 @@
 import argparse
+import errno
 import logging
 import os
+import select
 import subprocess
 import time
 import threading
 
-from .constants import IPV4, IPV6, REACHABLE
+from .constants import DEVICE_STATES, IPV4, IPV6, NTF_PROXY, RTMGRP_LINK, RTMGRP_NEIGH
 from .storage import DEFAULT_DB_PATH, DatabaseStorage, StorageError
 
 logger = logging.getLogger(__name__)
+
+# br-guest_turris is the guest bridge on systems migrated from Turris OS 5
+DEFAULT_INTERFACES = ('br-lan', 'br-guest-turris', 'br-guest_turris')
+
+# minimal time in seconds between neighbour table scans after lost messages
+RESYNC_INTERVAL = 30
 
 # how often to try storing devices that could not be stored, in seconds
 UNSAVED_RETRY_INTERVAL = 15 * 60
@@ -54,7 +62,37 @@ def get_interfaces(ipr, watched_interfaces):
         if ifname in watched_interfaces:
             interfaces[l['index']] = ifname
 
+    for ifname in watched_interfaces:
+        if ifname not in interfaces.values():
+            logger.info("Interface '%s' does not exist, it will be watched once it appears", ifname)
+    if not interfaces:
+        logger.warning('None of the watched interfaces exists: %s', ', '.join(watched_interfaces))
+
     return interfaces
+
+
+def update_interfaces(message, interfaces, watched_interfaces):
+    """Follow watched interfaces that are created, re-created or removed
+
+    netifd deletes a bridge when its interface goes down and creates it again
+    with a new index, e.g. on network restart.
+    """
+    if message.get('family') != 0:  # skip e.g. AF_BRIDGE messages about bridge ports
+        return
+    ifname = message.get_attr('IFLA_IFNAME')
+    index = message.get('index')
+    if ifname not in watched_interfaces or index is None:
+        return
+
+    if message.get('event') == 'RTM_NEWLINK':
+        if interfaces.get(index) == ifname:
+            return
+        for stale in [i for i, name in interfaces.items() if name == ifname]:
+            del interfaces[stale]
+        interfaces[index] = ifname
+        logger.info("Watching interface '%s' (index %d)", ifname, index)
+    elif interfaces.pop(index, None):
+        logger.info("Interface '%s' was removed", ifname)
 
 
 class DeviceTracker:
@@ -72,7 +110,7 @@ class DeviceTracker:
 
     def is_new(self, mac):
         if mac in self.unsaved:
-            self._retry_unsaved()
+            self.retry_unsaved()
             return False
 
         try:
@@ -86,11 +124,14 @@ class DeviceTracker:
             self._store_unsaved()
         return True
 
-    def _retry_unsaved(self):
-        """A device that could not be stored is still present, store it if the database works again
+    def retry_unsaved(self):
+        """Store devices that could not be stored, if the database works again
 
-        Tried at most once per UNSAVED_RETRY_INTERVAL, not for every message.
+        Tried at most once per UNSAVED_RETRY_INTERVAL: when such a device is
+        seen again, and from detect_devices() also when no message comes.
         """
+        if not self.unsaved:
+            return
         now = time.monotonic()
         if self.unsaved_retried is not None and now - self.unsaved_retried < UNSAVED_RETRY_INTERVAL:
             return
@@ -107,12 +148,31 @@ class DeviceTracker:
             self.unsaved.discard(mac)
 
 
+def is_device(message, interfaces):
+    """Is the neighbour entry one of a device on a watched interface?
+
+    Applies to the neighbour table scan and to broadcast messages alike. Bridge
+    FDB (AF_BRIDGE), proxy, static and NOARP entries are not devices.
+    """
+    return (
+        message.get('family') in (IPV4, IPV6)
+        and message.get('ifindex') in interfaces
+        and bool(message.get('state', 0) & DEVICE_STATES)
+        and not message.get('flags', 0) & NTF_PROXY
+    )
+
+
 def process_netlink_message(message, interfaces, tracker):
+    if not is_device(message, interfaces):
+        return
+
     mac = message.get_attr('NDA_LLADDR')
     ip = message.get_attr('NDA_DST')
 
     # sometimes IP or MAC address is missing in netlink message
     if not mac or not ip:
+        return
+    if int(mac.split(':')[0], 16) & 0x01:  # multicast or broadcast address
         return
 
     if tracker.is_new(mac):
@@ -121,24 +181,73 @@ def process_netlink_message(message, interfaces, tracker):
         new_device_notify(mac, ip, message['family'], interfaces[message['ifindex']])
 
 
-def get_neigbours_from_arp(ipr, interfaces, tracker):
-    """Explicit query ARP table for reachable devices on selected interfaces"""
-    for nic in interfaces:
-        devices = ipr.get_neighbours(ifindex=nic)
-
-        for dev in filter(lambda dev: dev['state'] == REACHABLE, devices):
-            process_netlink_message(dev, interfaces, tracker)
+def scan_neighbours(scanner, interfaces, tracker):
+    """Check devices already present in the neighbour table"""
+    for message in scanner.get_neighbours():
+        process_netlink_message(message, interfaces, tracker)
 
 
-def detect_devices(ipr, interfaces, tracker):
-    """Detect new devices from netlink broadcast"""
+def synchronize(scanner, interfaces, watched_interfaces, tracker, attempts=3):
+    """Find watched interfaces and check devices already in the neighbour table
+
+    The scanner is a netlink socket that is not subscribed to any broadcast,
+    so that the replies do not compete with broadcast messages for buffer
+    space (dumps are flow controlled, broadcast messages are not). Return
+    False when it failed.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            current = get_interfaces(scanner, watched_interfaces)
+            interfaces.clear()
+            interfaces.update(current)
+            scan_neighbours(scanner, interfaces, tracker)
+            return True
+        except Exception as e:  # e.g. pyroute2 NetlinkDumpInterrupted when links change meanwhile
+            error = e
+            logger.debug('Neighbour scan attempt %d failed', attempt, exc_info=True)
+    logger.warning('Neighbour scan failed, it is repeated later: %s', error)
+    return False
+
+
+def wait_for_messages(ipr, timeout):
+    """Wait at most timeout seconds for netlink messages, return whether some came"""
+    return bool(select.select([ipr], [], [], timeout)[0])
+
+
+def detect_devices(ipr, interfaces, watched_interfaces, tracker, scanner, sync_needed=False):
+    """Detect new devices from netlink broadcast
+
+    The kernel drops broadcast messages when the receive buffer is full and
+    reports it as ENOBUFS. Lost messages are then made up for by scanning the
+    neighbour table again, at most once per RESYNC_INTERVAL. A failed scan is
+    repeated the same way. Devices that could not be stored are tried again
+    also when no message comes.
+    """
+    last_sync = time.monotonic()
     while True:
-        for message in ipr.get():
-            if 'ifindex' not in message:  # missing interface
-                continue
+        try:
+            messages = ipr.get() if wait_for_messages(ipr, UNSAVED_RETRY_INTERVAL) else ()
+        except OSError as e:
+            if e.errno != errno.ENOBUFS:
+                raise
+            if not sync_needed:
+                logger.warning('Netlink receive buffer overflowed and messages were lost, scanning neighbours again')
+            sync_needed = True
+            messages = ()
+
+        if sync_needed and time.monotonic() - last_sync >= RESYNC_INTERVAL:
+            sync_needed = not synchronize(scanner, interfaces, watched_interfaces, tracker)
+            last_sync = time.monotonic()
+        tracker.retry_unsaved()
+
+        for message in messages:
+            event = message.get('event')
+
+            if event in ('RTM_NEWLINK', 'RTM_DELLINK'):
+                update_interfaces(message, interfaces, watched_interfaces)
 
             # we are interested only in new devices on selected interfaces
-            if message['event'] == 'RTM_NEWNEIGH' and message['ifindex'] in interfaces:
+            elif event == 'RTM_NEWNEIGH':
                 process_netlink_message(message, interfaces, tracker)
 
 
@@ -178,18 +287,18 @@ def main():
         watched_interfaces = uci.get(
             'dev-detect', 'watchlist', 'ifaces',
             dtype=str,
-            default=('br-lan', 'br-guest_turris'),
+            default=DEFAULT_INTERFACES,
             list=True
         )
 
     tracker = DeviceTracker(open_storage(db_path))
 
-    with IPRoute() as ipr:
-        ipr.bind()  # subscribe to netlink broadcast
+    with IPRoute() as ipr, IPRoute() as scanner:
+        ipr.bind(groups=RTMGRP_NEIGH | RTMGRP_LINK)  # subscribe to netlink broadcast
 
-        interfaces = get_interfaces(ipr, watched_interfaces)
-        get_neigbours_from_arp(ipr, interfaces, tracker)
-        detect_devices(ipr, interfaces, tracker)
+        interfaces = {}
+        synced = synchronize(scanner, interfaces, watched_interfaces, tracker)
+        detect_devices(ipr, interfaces, watched_interfaces, tracker, scanner, sync_needed=not synced)
 
 
 if __name__ == "__main__":
