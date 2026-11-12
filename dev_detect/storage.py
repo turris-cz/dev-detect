@@ -1,3 +1,4 @@
+import collections
 import logging
 import os
 import sqlite3
@@ -26,6 +27,11 @@ LEGACY_TABLE = 'known_devices'
 
 class StorageError(Exception):
     """The database of known devices cannot be read or written."""
+
+
+# When a known device was seen last time on the network and on any network
+# (0 if not yet), and whether it is known on every network
+Seen = collections.namedtuple('Seen', 'last_seen last_seen_anywhere everywhere')
 
 
 def _describe(exc):
@@ -215,7 +221,7 @@ class DatabaseStorage:
             pass
 
     def store(self, mac, iface, name=None, hostname=None, aliases=()):
-        """Store device seen on the interface. Return False if it was already stored on the network.
+        """Store device seen on the interface now. Return False if it was already stored on the network.
 
         aliases are other names of the network on the interface.
         """
@@ -233,7 +239,13 @@ class DatabaseStorage:
             .format(_placeholders(ifaces)),
             (mac, iface, now, now, mac) + ifaces,
         ))
-        return self._write(statements)[-1] == 1
+        # e.g. a device that came back after it was forgotten, never back (see touch())
+        statements.append((
+            'UPDATE device_networks SET last_seen=? WHERE mac=? AND iface IN ({})'
+            ' AND (last_seen IS NULL OR last_seen < ?)'.format(_placeholders(ifaces)),
+            (now, mac) + ifaces + (now,),
+        ))
+        return self._write(statements)[-2] == 1
 
     def touch(self, mac, ifaces):
         """Record that the known device is present on the network now
@@ -272,29 +284,31 @@ class DatabaseStorage:
         return updated + inserted > 0
 
     def seen(self, mac, ifaces, per_network=True):
-        """Return when the device was last seen on the network (ifaces are its names), None if it is unknown
+        """Return Seen of the device on the network (ifaces are its names), None if it is unknown
 
-        A known device that has not been seen on the network yet gives 0. With
-        per_network, a device is known on the network only when it was seen on
-        it or is known on every network.
+        With per_network, a device is known on the network only when it was
+        seen on it or is known on every network.
         """
         ifaces = tuple(ifaces)
 
         def query():
             if self._legacy:  # devices of 0.3.1 are known everywhere
-                return 'SELECT 1, NULL, NULL FROM known_devices WHERE mac=?', (mac,)
+                return 'SELECT 1, NULL, NULL, 0 FROM known_devices WHERE mac=?', (mac,)
             return (
-                'SELECT d.everywhere, n.iface, n.last_seen FROM devices d'
-                ' LEFT JOIN device_networks n ON n.mac = d.mac AND n.iface IN ({}) WHERE d.mac=?'
-                .format(_placeholders(ifaces)),
-                ifaces + (mac,),
+                'SELECT d.everywhere,'
+                ' (SELECT MAX(last_seen) FROM device_networks WHERE mac = d.mac AND iface IN ({0})),'
+                ' (SELECT MAX(last_seen) FROM device_networks WHERE mac = d.mac),'
+                ' EXISTS (SELECT 1 FROM device_networks WHERE mac = d.mac AND iface IN ({0}))'
+                ' FROM devices d WHERE d.mac=?'.format(_placeholders(ifaces)),
+                ifaces + ifaces + (mac,),
             )
         rows = self._read(query)
         if not rows:
             return None
-        if per_network and not any(everywhere or iface is not None for everywhere, iface, _ in rows):
+        everywhere, last_seen, last_seen_anywhere, on_network = rows[0]
+        if per_network and not (everywhere or on_network):
             return None
-        return max(last_seen or 0 for _, _, last_seen in rows)
+        return Seen(last_seen or 0, last_seen_anywhere or 0, bool(everywhere))
 
     def search(self, mac):
         """Is the device known (on any network)?"""

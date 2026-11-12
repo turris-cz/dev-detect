@@ -1,4 +1,5 @@
 import argparse
+import collections
 import errno
 import logging
 import os
@@ -29,6 +30,12 @@ LAST_SEEN_INTERVAL = 6 * 3600
 # how often to try storing devices that could not be stored, in seconds
 UNSAVED_RETRY_INTERVAL = 15 * 60
 
+DAY = 24 * 3600
+
+# A device to be reported. away is for how long a device that came back was
+# not seen (seconds), None for a new device.
+Report = collections.namedtuple('Report', 'away')
+
 ADDRMAP = {
     IPV4: '4',
     IPV6: '6'
@@ -43,10 +50,14 @@ def network_names(iface):
     return (iface,)
 
 
-def new_device_notify(mac, ip, addr_family, iface, on_reported=None):
-    logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
-                iface, mac, ADDRMAP.get(addr_family), ip)
-    notify.new_device(mac, ip, iface, on_reported)
+def new_device_notify(mac, ip, addr_family, iface, on_reported=None, away=None):
+    if away is None:
+        logger.info("New device detected on interface '%s'. MAC: %s | IPv%s address: %s",
+                    iface, mac, ADDRMAP.get(addr_family), ip)
+    else:
+        logger.info("Device came back to interface '%s' after %d days. MAC: %s | IPv%s address: %s",
+                    iface, away // DAY, mac, ADDRMAP.get(addr_family), ip)
+    notify.new_device(mac, ip, iface, on_reported, away=away)
 
 
 def get_interfaces(ipr, watched_interfaces):
@@ -119,11 +130,16 @@ class DeviceTracker:
     - unsaved: kept in memory, stored once the database works again.
     A device removed by `dev-detect remove` while pending is stored again
     after its notification, as it was reported.
+
+    With forget_after (days), a device that comes back after it was not seen
+    for longer is reported again, unless it is known on every network. It is
+    pending meanwhile too, although it is in the database.
     """
-    def __init__(self, storage, known_static_leases=False, per_network=False, thread_storage=None):
+    def __init__(self, storage, known_static_leases=False, per_network=False, thread_storage=None, forget_after=0):
         self.storage = storage
         self.known_static_leases = known_static_leases
         self.per_network = per_network
+        self.forget_after = max(forget_after, 0) * DAY
         # storage for notification threads, a connection cannot be shared by threads
         self.thread_storage = thread_storage or (lambda: DatabaseStorage(storage.db_path))
         self.lock = threading.Lock()  # for unsaved and pending, used by notification threads too
@@ -131,6 +147,7 @@ class DeviceTracker:
         self.pending = {}  # the same keys -> (mac, iface), devices whose notification was not created yet
         self.touch_attempts = {}  # (mac, network) -> when the presence was last tried to be recorded (monotonic)
         self.unsaved_retried = None  # when storing unsaved devices was last tried (monotonic)
+        self.recorded = {}  # key -> when this run stored the device or tried to record its presence (monotonic)
         self.learning = False
         self.learned = {}  # mac -> (interfaces, hostname)
 
@@ -161,9 +178,11 @@ class DeviceTracker:
         return (mac, min(network_names(iface))) if self.per_network else mac  # the same for all names
 
     def is_new(self, mac, iface, present=True):
-        """Is the device new? present means its presence was just confirmed (REACHABLE)
+        """Return Report if the device is to be reported, False otherwise
 
-        A new device to be reported is pending until device_reported() is called.
+        The device is new, or came back after it was forgotten. present means
+        its presence was just confirmed (REACHABLE). A device to be reported is
+        pending until device_reported() is called.
         """
         key = self._key(mac, iface)
         with self.lock:
@@ -174,15 +193,18 @@ class DeviceTracker:
             self.retry_unsaved()
             return False
 
+        away = None
         try:
-            last_seen = self.storage.seen(mac, network_names(iface), self.per_network)
+            seen = self.storage.seen(mac, network_names(iface), self.per_network)
         except StorageError as e:  # rather reported than missed
             logger.error('Cannot find out whether device %s is known, it is treated as new: %s', mac, e)
         else:
-            if last_seen is not None:
-                if present:
-                    self._touch(mac, iface, last_seen)
-                return False
+            if seen is not None:
+                away = self._away(seen, key) if present else None
+                if away is None:
+                    if present:
+                        self._touch(mac, iface, seen)
+                    return False
 
         lease_name = self._static_lease(mac)
         if lease_name is None and not self.learning:
@@ -190,7 +212,7 @@ class DeviceTracker:
                 if key in self.pending or key in self.unsaved:
                     return False
                 self.pending[key] = (mac, iface)
-            return True
+            return Report(away)
 
         # known without a separate notification, stored right away
         hostname = None
@@ -207,6 +229,7 @@ class DeviceTracker:
     def device_reported(self, device):
         """Store a reported device with its hostname (runs in the notification thread)"""
         key = self._key(device.mac, device.iface)
+        self._record(key)
         storage = self.thread_storage()
         try:
             storage.store(device.mac, device.iface, hostname=device.hostname,
@@ -222,6 +245,7 @@ class DeviceTracker:
                 self.pending.pop(key, None)
 
     def _store(self, key, mac, iface, name=None, hostname=None):
+        self._record(key)
         try:
             self.storage.store(mac, iface, name, hostname, aliases=network_names(iface)[1:])
         except Exception as e:
@@ -245,19 +269,50 @@ class DeviceTracker:
             logger.warning('Cannot read static DHCP leases', exc_info=True)
             return None
 
-    def _touch(self, mac, iface, last_seen):
+    def _record(self, key):
+        """Remember that this run stored the device or recorded its presence now, see _away()"""
+        if self.forget_after:
+            self.recorded[key] = time.monotonic()
+
+    def _away(self, seen, key):
+        """Return for how long a known device was not seen if it is forgotten, None otherwise
+
+        Only a device that dev-detect stored itself is forgotten, not one known
+        on every network (e.g. added by `dev-detect add`). The time counts from
+        the stored last seen time, or from when this run last stored the device
+        or recorded its presence if that is later: the stored time can be wrong
+        (the clock of a router without RTC set by NTP after the start) or old
+        (database not writable).
+        """
+        if not self.forget_after or seen.everywhere:
+            return None
+        last_seen = seen.last_seen if self.per_network else seen.last_seen_anywhere
+        if not last_seen:
+            return None
+        away = time.time() - last_seen
+        recorded = self.recorded.get(key)
+        if recorded is not None:
+            away = min(away, time.monotonic() - recorded)
+        # last seen is recorded once per LAST_SEEN_INTERVAL, the device may have left that much later
+        return away if away > self.forget_after + LAST_SEEN_INTERVAL else None
+
+    def _touch(self, mac, iface, seen):
         """Record presence on the network, at most once per LAST_SEEN_INTERVAL
 
         Counted from the stored time, so that restarting the daemon does not
-        write it again for every device present.
+        write it again for every device present. While the clock is behind a
+        time stored for the device (e.g. before NTP sets it), the presence is
+        written, but this run does not count it as seen, see _away().
         """
-        if last_seen and time.time() - last_seen < LAST_SEEN_INTERVAL:
+        if seen.last_seen and time.time() - seen.last_seen < LAST_SEEN_INTERVAL:
             return
         key = (mac, min(network_names(iface)))  # per network also without per_network
         attempted = self.touch_attempts.get(key)
         if attempted is not None and time.monotonic() - attempted < LAST_SEEN_INTERVAL:
             return  # e.g. the database is not writable
         self.touch_attempts[key] = time.monotonic()
+        if time.time() >= seen.last_seen_anywhere:
+            self._record(self._key(mac, iface))
         try:
             self.storage.touch(mac, network_names(iface))
         except StorageError as e:  # not worth more than the next attempt in LAST_SEEN_INTERVAL
@@ -366,8 +421,9 @@ def process_netlink_message(message, interfaces, tracker):
         return
 
     iface = interfaces[message['ifindex']]
-    if tracker.is_new(mac, iface, present=bool(message.get('state', 0) & REACHABLE)):
-        new_device_notify(mac, ip, message['family'], iface, on_reported=tracker.device_reported)
+    report = tracker.is_new(mac, iface, present=bool(message.get('state', 0) & REACHABLE))
+    if report:
+        new_device_notify(mac, ip, message['family'], iface, on_reported=tracker.device_reported, away=report.away)
 
 
 def scan_neighbours(scanner, interfaces, tracker):
@@ -459,6 +515,7 @@ def read_config(uci):
         'learn_on_empty': uci.get('dev-detect', 'detection', 'learn_on_empty', dtype=bool, default=True),
         'known_static_leases': uci.get('dev-detect', 'detection', 'known_static_leases', dtype=bool, default=True),
         'per_network': uci.get('dev-detect', 'detection', 'per_network', dtype=bool, default=True),
+        'forget_after': uci.get('dev-detect', 'detection', 'forget_after', dtype=int, default=0),
     }
 
 
@@ -484,7 +541,10 @@ def main():
         config = read_config(uci)
     watched_interfaces = config['interfaces']
 
-    tracker = DeviceTracker(open_storage(config['db_path']), config['known_static_leases'], config['per_network'])
+    tracker = DeviceTracker(
+        open_storage(config['db_path']), config['known_static_leases'], config['per_network'],
+        forget_after=config['forget_after'],
+    )
     if config['learn_on_empty']:
         tracker.start_learning()
 

@@ -76,6 +76,23 @@ config detection 'detection'
     option learn_on_empty '0'
 ```
 
+## Forgetting devices
+
+A device that comes back after a long time can be reported again. Set after how many days a device that was not seen is forgotten (`0`, the default, never forgets):
+
+```
+config detection 'detection'
+    option forget_after '90'
+```
+
+The notification then says how long the device was away:
+
+```
+Device back on network lan after 120 days: Mac
+```
+
+The time counts from when the device was last seen on the network (on any network with `per_network '0'`). That is recorded at most once per 6 hours, so a device is reported after it was away for the set number of days and up to 6 hours more. Devices added by `dev-detect add` (or stored by older versions) are not forgotten, nor are devices with a static DHCP lease unless `known_static_leases` is `0`. After a restart of the daemon, a device can be reported as back also when the database could not be written for long. A router without RTC has a wrong clock until NTP sets it after a restart; a device seen meanwhile can be reported with fewer days, not at all, or also when it was not away for that long.
+
 ## Persistence
 
 Detected devices are stored in sqlite database in order to remember already discovered devices.

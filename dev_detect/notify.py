@@ -35,6 +35,9 @@ LEARNED_LIMIT = 20
 TEXTS = {
     'cs': {
         'title': 'Nové zařízení v síti {network}: {name}',
+        'back': 'Zařízení se vrátilo do sítě {network} po {days}: {name}',
+        'day': '{count} dni',
+        'days': '{count} dnech',
         'mac': 'MAC adresa: {mac}',
         'randomized': 'náhodná adresa, výrobce neznámý',
         'learned': 'Databáze zařízení byla při startu prázdná, proto byla již přítomná zařízení uložena'
@@ -43,6 +46,9 @@ TEXTS = {
     },
     'en': {
         'title': 'New device on network {network}: {name}',
+        'back': 'Device back on network {network} after {days}: {name}',
+        'day': '{count} day',
+        'days': '{count} days',
         'mac': 'MAC address: {mac}',
         'randomized': 'randomized address, vendor unknown',
         'learned': 'The device database was empty at start, so devices already present were stored'
@@ -60,6 +66,7 @@ class Device:
         self.hostname = None
         self.vendor = None
         self.addresses = set()
+        self.away = None  # seconds a device that came back was not seen
 
 
 def is_randomized(mac):
@@ -251,8 +258,15 @@ def vendor(mac):
 def compose(device, lang):
     texts = TEXTS[lang]
     detail = texts['randomized'] if is_randomized(device.mac) else device.vendor
+    if device.away is None:
+        title = texts['title']
+        days = None
+    else:
+        count = int(device.away // (24 * 3600))
+        title = texts['back']
+        days = texts['day' if count == 1 else 'days'].format(count=count)
     lines = [
-        texts['title'].format(network=device.network, name=device.hostname or device.mac),
+        title.format(network=device.network, name=device.hostname or device.mac, days=days),
         texts['mac'].format(mac=device.mac) + (' ({})'.format(detail) if detail else ''),
     ]
     for address in sort_addresses(device.addresses):
@@ -351,13 +365,14 @@ class Notifier:
         self.thread = None
         self.lock = threading.Lock()
 
-    def add(self, mac, ip, iface, on_reported=None):
+    def add(self, mac, ip, iface, on_reported=None, away=None):
         """Report device in background
 
         on_reported is called with the Device after the notification was
-        created (or creating it failed).
+        created (or creating it failed). away is for how long a device that
+        came back was not seen (seconds).
         """
-        self.queue.put((mac, ip, iface, on_reported))
+        self.queue.put((mac, ip, iface, on_reported, away))
         if not self.background:
             return
         with self.lock:
@@ -396,8 +411,9 @@ class Notifier:
             self.lookup()
 
     def _accept(self, item):
-        mac, ip, iface, on_reported = item
+        mac, ip, iface, on_reported, away = item
         device = Device(mac, iface)
+        device.away = away
         device.addresses.update(str(address) for address in parse_addresses([ip]))
         self.waiting.append(_Waiting(device, self.clock(), on_reported))
 
@@ -474,6 +490,6 @@ class Notifier:
 notifier = Notifier()
 
 
-def new_device(mac, ip, iface, on_reported=None):
+def new_device(mac, ip, iface, on_reported=None, away=None):
     """Report new device in background, once more is known about it (see Notifier.add)"""
-    notifier.add(mac, ip, iface, on_reported)
+    notifier.add(mac, ip, iface, on_reported, away)

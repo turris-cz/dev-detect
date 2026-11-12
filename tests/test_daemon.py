@@ -10,7 +10,7 @@ import pytest
 
 import dev_detect.__main__ as daemon
 from dev_detect import notify
-from dev_detect.storage import DatabaseStorage, StorageError
+from dev_detect.storage import DatabaseStorage, Seen, StorageError
 
 MAC = '3e:f1:18:4d:d9:23'
 OTHER_MAC = 'aa:bb:cc:dd:ee:ff'
@@ -46,7 +46,7 @@ class FailingStorage:
             raise StorageError('/srv/dev-detect/dev-detect.db: SQLITE_IOERR')
         if mac not in self.networks or per_network and not self.networks[mac] & set(ifaces):
             return None
-        return 0
+        return Seen(0, 0, False)
 
     def touch(self, mac, ifaces):
         self.touched.append(mac)
@@ -68,8 +68,8 @@ def notified(monkeypatch):
     """Notifications sent, each created at once"""
     sent = []
 
-    def new_device_notify(mac, ip, family, iface, on_reported=None):
-        sent.append(mac)
+    def new_device_notify(mac, ip, family, iface, on_reported=None, away=None):
+        sent.append(mac if away is None else (mac, int(away // daemon.DAY)))  # days of a device that came back
         if on_reported:
             on_reported(notify.Device(mac, iface))
     monkeypatch.setattr(daemon, 'new_device_notify', new_device_notify)
@@ -550,6 +550,7 @@ def test_config_defaults():
         'learn_on_empty': True,
         'known_static_leases': True,
         'per_network': True,
+        'forget_after': 0,
     }
     assert not daemon.read_config(ConfigEUci(learn_on_empty=False))['learn_on_empty']
 
@@ -880,7 +881,7 @@ def notifications(monkeypatch):
     """Notifications waiting to be created, their callbacks are called by the test"""
     waiting = []
 
-    def new_device_notify(mac, ip, family, iface, on_reported=None):
+    def new_device_notify(mac, ip, family, iface, on_reported=None, away=None):
         waiting.append((notify.Device(mac, iface), on_reported))
     monkeypatch.setattr(daemon, 'new_device_notify', new_device_notify)
     return waiting
@@ -1065,3 +1066,361 @@ def test_unsaved_device_is_stored_also_when_no_message_comes(notified, clock, mo
 
     assert storage.stored == [(MAC, 'br-lan')]
     assert not tracker.unsaved
+
+
+DAY = daemon.DAY
+
+
+@pytest.fixture
+def forgetting(tmp_path, clock):
+    """Database with MAC seen on br-lan now, and a tracker forgetting after 30 days"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    return daemon.DeviceTracker(storage, per_network=True, forget_after=30)
+
+
+def test_device_that_comes_back_after_forget_after_is_reported_again(forgetting, notified, clock):
+    clock[0] += 31 * DAY
+    feed(forgetting, [LAN] * 3)
+    clock[0] += 60
+    feed(forgetting, [LAN] * 3)
+
+    assert notified == [(MAC, 31)]  # once, last seen is stored after the notification
+    assert [row[3:5] for row in forgetting.storage.devices()] == [(1700000000, 1700000000 + 31 * DAY)]
+
+
+def test_device_that_comes_back_sooner_is_not_reported(forgetting, notified, clock):
+    clock[0] += 29 * DAY
+    feed(forgetting, [LAN])
+
+    assert notified == []
+    assert [row[4] for row in forgetting.storage.devices()] == [1700000000 + 29 * DAY]  # its presence recorded
+
+
+def test_stale_entry_of_forgotten_device_is_not_reported(forgetting, notified, clock):
+    """Entries of devices that left stay STALE in the neighbour table for long"""
+    clock[0] += 31 * DAY
+    feed(forgetting, [Message(MAC, '192.168.1.50', family=2, state=0x04)])
+
+    assert notified == []
+
+
+def test_device_known_everywhere_is_not_forgotten(forgetting, notified, clock):
+    forgetting.storage.add(MAC)
+    clock[0] += 400 * DAY
+    feed(forgetting, [LAN])
+
+    assert notified == []
+
+
+def test_forgotten_device_with_static_lease_is_stored_without_report(tmp_path, notified, clock, dhcp):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, known_static_leases=True, per_network=True, forget_after=30)
+    feed(tracker, [STATIC])
+    clock[0] += 31 * DAY
+    feed(tracker, [STATIC])
+
+    assert notified == []
+    assert [row[4] for row in storage.devices()] == [1700000000 + 31 * DAY]
+
+
+def test_devices_are_not_forgotten_by_default(tmp_path, notified, clock):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    clock[0] += 1000 * DAY
+    feed(daemon.DeviceTracker(storage, per_network=True), [LAN])
+
+    assert notified == []
+
+
+@pytest.mark.parametrize('per_network, expected', [(True, [(MAC, 31)]), (False, [])])
+def test_device_seen_on_another_network_meanwhile(tmp_path, notified, clock, per_network, expected):
+    """Without per_network, a device is forgotten only when it was not seen on any network"""
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    storage.store(MAC, 'br-guest-turris')
+    tracker = daemon.DeviceTracker(storage, per_network=per_network, forget_after=30)
+    clock[0] += 20 * DAY
+    feed_networks(tracker, [GUEST])  # recorded on the guest network
+    clock[0] += 11 * DAY
+    feed_networks(tracker, [LAN])
+
+    assert notified == expected
+
+
+def test_device_that_came_back_is_reported_with_how_long_it_was_away(forgetting, monkeypatch, clock):
+    reports = []
+    monkeypatch.setattr(daemon.notify, 'new_device', lambda mac, ip, iface, on_reported=None, away=None:
+                        reports.append((mac, iface, away)))
+    clock[0] += 45 * DAY
+    feed(forgetting, [LAN])
+
+    assert reports == [(MAC, 'br-lan', 45 * DAY)]
+
+
+def test_database_writes_of_device_that_came_back(forgetting, notified, commits, clock):
+    clock[0] += 31 * DAY
+    del commits[:]
+    feed(forgetting, [LAN] * 3)
+
+    assert len(commits) == 1  # stored after the notification
+
+
+@pytest.fixture
+def clocks(monkeypatch):
+    """Wall clock and monotonic clock, moved separately by the test"""
+    wall, mono = [1700000000.0], [1000.0]
+    monkeypatch.setattr(daemon.time, 'time', lambda: wall[0])
+    monkeypatch.setattr(daemon.time, 'monotonic', lambda: mono[0])
+    return wall, mono
+
+
+def test_device_stored_before_clock_was_set_is_not_reported_as_back(tmp_path, notified, clocks):
+    """A router without RTC starts with its clock behind until NTP sets it"""
+    wall, mono = clocks
+    wall[0] -= 60 * DAY
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, per_network=True, forget_after=30)
+    feed(tracker, [LAN])  # reported and stored with the wrong time
+    wall[0] += 60 * DAY
+    mono[0] += 60
+    feed(tracker, [LAN])
+
+    assert notified == [MAC]
+    assert [row[4] for row in storage.devices()] == [1700000000]  # corrected
+
+
+def test_learned_devices_before_clock_was_set_are_not_reported_as_back(tmp_path, notified, learned, clocks):
+    wall, mono = clocks
+    wall[0] -= 60 * DAY
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), per_network=True, forget_after=30)
+    start(tracker, LAN, Message(OTHER_MAC, '192.168.1.51', family=2))
+    wall[0] += 60 * DAY
+    mono[0] += 60
+    feed(tracker, [LAN, Message(OTHER_MAC, '192.168.1.51', family=2)])
+
+    assert [mac for mac, _, _ in learned] == [MAC, OTHER_MAC]
+    assert notified == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_present_device_is_not_forgotten_when_database_cannot_be_written(tmp_path, notified, clocks):
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(MAC, 'br-lan')
+    os.chmod(db_path, 0o444)
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    for _ in range(40 * 24):  # present for 40 days
+        feed(tracker, [LAN])
+        wall[0] += 3600
+        mono[0] += 3600
+
+    assert notified == []
+
+
+def test_device_away_for_less_than_forget_after_is_not_reported(tmp_path, notified, clocks):
+    """Last seen is recorded once per 6 hours, so it can be older than when the device left"""
+    wall, mono = clocks
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    for day in range(7):  # 2 hours every morning, a minute later each day; the daemon restarted meanwhile
+        tracker = daemon.DeviceTracker(storage, per_network=True, forget_after=1)
+        for _ in range(12):
+            feed(tracker, [LAN])
+            wall[0] += 600
+            mono[0] += 600
+        wall[0] += 22 * 3600 + 60
+        mono[0] += 22 * 3600 + 60
+    assert notified == [MAC]
+
+    wall[0] += 31 * 3600
+    mono[0] += 31 * 3600
+    feed(daemon.DeviceTracker(storage, per_network=True, forget_after=1), [LAN])
+    assert notified == [MAC, (MAC, 2)]
+
+
+def test_device_with_static_lease_is_forgotten_without_known_static_leases(tmp_path, notified, clock, dhcp):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    tracker = daemon.DeviceTracker(storage, known_static_leases=False, per_network=True, forget_after=30)
+    feed(tracker, [STATIC])
+    clock[0] += 31 * DAY
+    feed(daemon.DeviceTracker(storage, known_static_leases=False, per_network=True, forget_after=30), [STATIC])
+
+    assert notified == ['02:00:00:00:00:01', ('02:00:00:00:00:01', 31)]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not apply to root')
+def test_away_counts_from_when_this_run_saw_the_device(tmp_path, notified, clocks):
+    """The stored time is old while the database cannot be written"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    wall[0] -= 10 * DAY
+    DatabaseStorage(db_path).store(MAC, 'br-lan')
+    wall[0] += 10 * DAY
+    os.chmod(db_path, 0o444)
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    for _ in range(34):  # present for 5 hours 40 minutes
+        feed(tracker, [LAN])
+        wall[0] += 600
+        mono[0] += 600
+    wall[0] += 30 * DAY
+    mono[0] += 30 * DAY
+    feed(tracker, [LAN])  # away for less than 30 days
+    assert notified == []
+
+    for _ in range(160 * 4):  # present for 160 days
+        feed(tracker, [LAN])
+        wall[0] += 6 * 3600
+        mono[0] += 6 * 3600
+    wall[0] += 40 * DAY
+    mono[0] += 40 * DAY
+    feed(tracker, [LAN])
+    assert notified == [(MAC, 40)]  # not 200 days from the stored time
+
+
+def test_nothing_is_recorded_without_forget_after(tmp_path, notified, clock):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(OTHER_MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(storage, per_network=True)
+    clock[0] += daemon.LAST_SEEN_INTERVAL
+    feed(tracker, EVENTS + [Message(OTHER_MAC, '192.168.1.51', family=2)])
+
+    assert notified == [MAC]
+    assert tracker.recorded == {}
+
+
+def test_restart_with_clock_at_1970_until_ntp_does_not_report_present_device(tmp_path, notified, clocks):
+    """A router without RTC can start at the epoch; the device stays all the time"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(MAC, 'br-lan')  # 3 hours before the restart
+    now = wall[0] + 3 * 3600
+    wall[0] = 0
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    feed(tracker, [LAN])
+    wall[0] = now + 300  # NTP
+    mono[0] += 300
+    feed(tracker, [LAN])
+    wall[0] += 6 * 3600
+    mono[0] += 6 * 3600
+    feed(tracker, [LAN])
+
+    assert notified == []
+    assert [row[4] for row in tracker.storage.devices()] == [int(wall[0])]
+
+
+def test_device_back_while_clock_at_1970_is_reported_once_after_ntp(tmp_path, notified, clocks):
+    """It really was away, but the clock tells how long only after NTP"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(MAC, 'br-lan')
+    now = wall[0] + 120 * DAY
+    wall[0] = 0
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    feed(tracker, [LAN])
+    assert notified == []
+    wall[0] = now  # NTP
+    mono[0] += 300
+    feed(tracker, [LAN] * 3)
+
+    assert notified == [(MAC, 120)]
+
+
+def test_device_back_on_another_network_while_clock_at_1970_is_reported_after_ntp(tmp_path, notified, clocks):
+    """Its presence written before NTP does not count as seen by this run"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    DatabaseStorage(db_path).store(MAC, 'br-guest-turris')
+    now = wall[0] + 120 * DAY
+    wall[0] = 0
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), forget_after=30)
+    feed_networks(tracker, [LAN])
+    assert notified == []
+    wall[0] = now  # NTP
+    mono[0] += 300
+    feed_networks(tracker, [LAN] * 3)
+
+    assert notified == [(MAC, 120)]
+
+
+def test_device_back_while_clock_is_behind_is_reported_after_ntp(tmp_path, notified, clocks):
+    """E.g. OpenWrt sets the clock at boot to the time of the newest file in /etc"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    storage = DatabaseStorage(db_path)
+    storage.store(MAC, 'br-lan')
+    wall[0] += 30 * DAY
+    storage.store(MAC, 'br-guest-turris')
+    now = wall[0] + 120 * DAY
+    wall[0] = now - 140 * DAY  # behind the time on br-guest-turris, not the one on br-lan
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    feed_networks(tracker, [LAN])
+    assert notified == []
+    wall[0] = now  # NTP
+    mono[0] += 300
+    feed_networks(tracker, [LAN] * 3)
+
+    assert notified == [(MAC, 140)]  # counted from the time written before NTP
+
+
+def test_device_seen_only_before_ntp_is_not_reported_as_back_later(tmp_path, notified, clocks):
+    """Its presence is written with the clock as it is"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    storage = DatabaseStorage(db_path)
+    storage.store(MAC, 'br-lan')
+    wall[0] += 24 * DAY
+    storage.store(MAC, 'br-guest-turris')
+    now = wall[0] + DAY
+    wall[0] = now - 10 * DAY  # behind the time on br-guest-turris
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    feed_networks(tracker, [LAN])  # then the device leaves
+    wall[0] = now + 10 * DAY  # NTP set the clock meanwhile
+    mono[0] += 10 * DAY
+    feed_networks(tracker, [LAN])
+
+    assert notified == []
+
+
+def test_device_with_time_stored_while_clock_was_ahead_is_not_reported_as_back(tmp_path, notified, clocks):
+    """Its presence is written also while the clock is behind that time"""
+    wall, mono = clocks
+    db_path = str(tmp_path / 'dev-detect.db')
+    wall[0] += 100 * DAY
+    DatabaseStorage(db_path).store(MAC, 'br-guest-turris')
+    wall[0] -= 100 * DAY
+    DatabaseStorage(db_path).store(MAC, 'br-lan')
+    tracker = daemon.DeviceTracker(DatabaseStorage(db_path), per_network=True, forget_after=30)
+    for _ in range(110 * 4):  # present on br-lan for 110 days
+        feed_networks(tracker, [LAN])
+        wall[0] += 6 * 3600
+        mono[0] += 6 * 3600
+
+    assert notified == []
+
+
+def test_new_device_while_clock_at_1970_is_not_reported_back_after_ntp(tmp_path, notified, clocks):
+    wall, mono = clocks
+    now = wall[0]
+    wall[0] = 0
+    tracker = daemon.DeviceTracker(DatabaseStorage(str(tmp_path / 'dev-detect.db')), per_network=True, forget_after=30)
+    feed(tracker, [LAN])  # stored at the epoch
+    wall[0] = now  # NTP
+    mono[0] += 300
+    feed(tracker, [LAN])
+
+    assert notified == [MAC]
+    assert [row[4] for row in tracker.storage.devices()] == [int(now)]  # corrected
+
+
+@pytest.mark.parametrize('away, reported', [
+    (90 * DAY, False),
+    (90 * DAY + daemon.LAST_SEEN_INTERVAL, False),
+    (90 * DAY + daemon.LAST_SEEN_INTERVAL + 1, True),
+])
+def test_forget_after_limit(tmp_path, notified, clock, away, reported):
+    storage = DatabaseStorage(str(tmp_path / 'dev-detect.db'))
+    storage.store(MAC, 'br-lan')
+    clock[0] += away
+    feed(daemon.DeviceTracker(storage, per_network=True, forget_after=90), [LAN])
+
+    assert notified == ([(MAC, 90)] if reported else [])

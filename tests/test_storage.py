@@ -6,7 +6,7 @@ import time
 import pytest
 
 from dev_detect import storage as storage_module
-from dev_detect.storage import SCHEMA_VERSION, DatabaseStorage, StorageError
+from dev_detect.storage import SCHEMA_VERSION, DatabaseStorage, Seen, StorageError
 
 MAC = 'aa:bb:cc:dd:ee:ff'
 OTHER_MAC = 'a1:b2:c3:d4:e5:f6'
@@ -175,11 +175,44 @@ def test_seen(storage, monkeypatch):
     storage.store(MAC, 'br-lan')
     storage.add(OTHER_MAC)
 
-    assert storage.seen(MAC, ('br-lan',)) == 1700000000
+    assert storage.seen(MAC, ('br-lan',)) == Seen(1700000000, 1700000000, False)
     assert storage.seen(MAC, GUEST) is None  # not on this network yet
-    assert storage.seen(MAC, GUEST, per_network=False) == 0  # known, not seen there
-    assert storage.seen(OTHER_MAC, GUEST) == 0  # known on every network
+    assert storage.seen(MAC, GUEST, per_network=False) == Seen(0, 1700000000, False)  # known, not seen there
+    assert storage.seen(OTHER_MAC, GUEST) == Seen(0, 0, True)  # known on every network
     assert storage.seen('02:00:00:00:00:01', ('br-lan',), per_network=False) is None
+
+
+def test_seen_on_other_networks(storage, monkeypatch):
+    clock = [1700000000]
+    monkeypatch.setattr(storage_module.time, 'time', lambda: clock[0])
+    storage.store(MAC, 'br-lan')
+    clock[0] += 3600
+    storage.store(MAC, 'br-guest_turris')
+    storage.add(MAC)
+
+    assert storage.seen(MAC, ('br-lan',)) == Seen(1700000000, 1700003600, True)
+    assert storage.seen(MAC, GUEST) == Seen(1700003600, 1700003600, True)
+
+
+def test_store_records_that_known_device_is_present(storage, monkeypatch):
+    """E.g. a device that came back after it was forgotten"""
+    clock = [1700000000]
+    monkeypatch.setattr(storage_module.time, 'time', lambda: clock[0])
+    storage.store(MAC, 'br-guest_turris')
+    clock[0] += 100 * 24 * 3600
+
+    assert not storage.store(MAC, 'br-guest-turris', aliases=('br-guest_turris',))
+    assert network_rows(storage.db_path) == [(MAC, 'br-guest_turris', 1700000000, 1700000000 + 100 * 24 * 3600)]
+
+
+def test_store_does_not_move_last_seen_back(storage, monkeypatch):
+    clock = [1700000000]
+    monkeypatch.setattr(storage_module.time, 'time', lambda: clock[0])
+    storage.store(MAC, 'br-lan')
+    clock[0] -= 3600
+    storage.store(MAC, 'br-lan')
+
+    assert network_rows(storage.db_path) == [(MAC, 'br-lan', 1700000000, 1700000000)]
 
 
 def test_seen_on_any_name_of_the_network(storage):
@@ -407,7 +440,7 @@ def test_old_database_is_upgraded(tmp_path):
 
     assert storage.search(MAC) and storage.search(OTHER_MAC)
     assert storage.devices() == [(MAC, None, '', None, None, None), (OTHER_MAC, None, '', None, None, None)]
-    assert storage.seen(MAC, ('br-lan',)) == 0  # known on every network, as before
+    assert storage.seen(MAC, ('br-lan',)) == Seen(0, 0, True)  # known on every network, as before
     assert schema_version(db_path) == SCHEMA_VERSION
     assert tables(db_path) == {'devices', 'device_networks'}
     storage.close()
@@ -421,7 +454,7 @@ def test_old_read_only_database_is_still_readable(tmp_path):
     storage = DatabaseStorage(db_path)
 
     assert storage.search(MAC)
-    assert storage.seen(MAC, ('br-lan',)) == 0  # known everywhere
+    assert storage.seen(MAC, ('br-lan',)) == Seen(0, 0, True)  # known everywhere
     assert storage.seen(OTHER_MAC, ('br-lan',)) is None
     assert storage.devices() == [(MAC, None, '', None, None, None)]
     assert not storage.is_empty()
@@ -464,7 +497,7 @@ def test_database_of_development_version_is_upgraded(tmp_path):
     conn.close()
 
     storage = DatabaseStorage(db_path)
-    assert storage.seen(MAC, GUEST) == 0  # known everywhere, not reported again
+    assert storage.seen(MAC, GUEST) == Seen(0, 0, True)  # known everywhere, not reported again
     assert storage.store('02:00:00:00:00:01', 'br-lan')
     assert storage.get_known() == [MAC, OTHER_MAC, '02:00:00:00:00:01']
     assert schema_version(db_path) == SCHEMA_VERSION
@@ -517,7 +550,7 @@ def test_failed_upgrade_is_repeated(tmp_path):
     storage = DatabaseStorage(db_path)
 
     assert storage.search(MAC)  # still readable
-    assert storage.seen(MAC, ('br-lan',)) == 0
+    assert storage.seen(MAC, ('br-lan',)) == Seen(0, 0, True)
     with pytest.raises(StorageError, match='cannot be upgraded.*no column named mac'):
         storage.store(OTHER_MAC, 'br-lan')
     conn.execute('DROP TABLE devices')
@@ -525,7 +558,7 @@ def test_failed_upgrade_is_repeated(tmp_path):
     conn.close()
 
     assert storage.store(OTHER_MAC, 'br-lan')
-    assert storage.seen(MAC, ('br-lan',)) == 0
+    assert storage.seen(MAC, ('br-lan',)) == Seen(0, 0, True)
     assert schema_version(db_path) == SCHEMA_VERSION
     storage.close()
 
@@ -609,7 +642,7 @@ def test_backup_restored_into_open_database(tmp_path):
     old.close()
     target.close()
 
-    assert storage.seen(MAC, ('br-lan',)) == 0
+    assert storage.seen(MAC, ('br-lan',)) == Seen(0, 0, True)
     assert storage.store(OTHER_MAC, 'br-lan')
     assert schema_version(db_path) == SCHEMA_VERSION
     storage.close()

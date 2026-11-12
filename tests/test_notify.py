@@ -198,6 +198,19 @@ def test_compose_with_vendor_and_without_hostname():
     )
 
 
+@pytest.mark.parametrize('days, cs, en', [
+    (120, 'Zařízení se vrátilo do sítě lan po 120 dnech: Mac', 'Device back on network lan after 120 days: Mac'),
+    (1, 'Zařízení se vrátilo do sítě lan po 1 dni: Mac', 'Device back on network lan after 1 day: Mac'),
+])
+def test_compose_device_that_came_back(days, cs, en):
+    dev = device()
+    dev.away = days * 24 * 3600 + 3600
+
+    assert notify.compose(dev, 'cs').splitlines()[0] == cs
+    assert notify.compose(dev, 'en').splitlines()[0] == en
+    assert notify.compose(dev, 'en').splitlines()[1:] == notify.compose(device(), 'en').splitlines()[1:]
+
+
 @pytest.mark.parametrize('lang', ['cs', 'en'])
 @pytest.mark.parametrize('dev', [device(), device(APPLE_MAC, None, None, ['192.168.1.60'])])
 def test_composed_message_has_no_double_spaces(lang, dev):
@@ -544,6 +557,15 @@ def test_created_notification_is_logged(lookups, clock, monkeypatch, caplog, cre
     run_until(notifier, clock, 1000 + notify.MAX_LOOKUP_TIME)
 
     assert ('Created notification about device f0:18:98:aa:bb:cc' in caplog.text) is created
+
+
+def test_notifier_keeps_how_long_device_was_away(lookups, clock):
+    lookups.add_lease(MAC, '192.168.1.50', 'Mac')
+    notifier = notify.Notifier(clock, background=False)
+    notifier.add(MAC, '192.168.1.50', 'br-lan', away=40 * 24 * 3600)
+    run_until(notifier, clock, 1000 + notify.FIRST_LOOKUP_DELAY)
+
+    assert [(device.mac, device.away) for device in lookups.sent] == [(MAC, 40 * 24 * 3600)]
 
 
 def test_notifier_thread(lookups, monkeypatch):
