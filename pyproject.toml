@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dev-detect"
-version = "0.3.1"
+version = "0.4"
 description = "Small utility to detect devices on local network"
 readme = "README.md"
 license = {text = "GPL-3.0-only"}
